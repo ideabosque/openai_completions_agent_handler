@@ -35,6 +35,12 @@ def _omit_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _truncate(s: str, limit: int = 200) -> str:
+    if s is None:
+        return ""
+    return s if len(s) <= limit else f"{s[:limit]}...({len(s)} chars)"
+
+
 class OpenAICompletionsEventHandler(AIAgentEventHandler):
     """
     Manages conversations and function calls via OpenAI's Chat Completions API.
@@ -547,54 +553,68 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]
     ) -> Any:
-        agent_function = self.get_function(function_call_data["name"])
+        name = function_call_data["name"]
+        tool_call_id = function_call_data["id"]
+
+        agent_function = self.get_function(name)
         if not agent_function:
-            raise ValueError(
-                f"Unsupported function requested: {function_call_data['name']}"
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(
+                    f"[TOOL_CALL] id={tool_call_id} name={name} status=unknown_tool"
+                )
+            raise ValueError(f"Unsupported function requested: {name}")
+
+        arguments_json = Serializer.json_dumps(arguments)
+
+        if self.logger and self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"[TOOL_CALL] id={tool_call_id} name={name} "
+                f"args={_truncate(arguments_json)}"
             )
 
         try:
-            arguments_json = Serializer.json_dumps(arguments)
-
             self.invoke_async_funct(
                 module_name="ai_agent_core_engine",
                 class_name="AIAgentCoreEngine",
                 function_name="async_insert_update_tool_call",
                 **{
-                    "tool_call_id": function_call_data["id"],
+                    "tool_call_id": tool_call_id,
                     "tool_type": function_call_data["type"],
-                    "name": function_call_data["name"],
+                    "name": name,
                     "arguments": arguments_json,
                     "status": "in_progress",
                 },
             )
 
-            if self.enable_timeline_log:
-                function_exec_start = pendulum.now("UTC")
-
+            exec_start = pendulum.now("UTC")
             function_output = agent_function(**arguments)
+            exec_ms = (pendulum.now("UTC") - exec_start).total_seconds() * 1000
+
+            serialized_output = Serializer.json_dumps(function_output)
+
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[TOOL_RESULT] id={tool_call_id} name={name} status=completed "
+                    f"exec_ms={exec_ms:.1f} output_chars={len(serialized_output)} "
+                    f"output={_truncate(serialized_output)}"
+                )
 
             if (
                 self.enable_timeline_log
                 and self.logger
                 and self.logger.isEnabledFor(logging.INFO)
             ):
-                function_exec_time = (
-                    pendulum.now("UTC") - function_exec_start
-                ).total_seconds() * 1000
                 elapsed = self._get_elapsed_time()
                 self.logger.info(
-                    f"[TIMELINE] T+{elapsed:.2f}ms: Function '{function_call_data['name']}' executed (took {function_exec_time:.2f}ms)"
+                    f"[TIMELINE] T+{elapsed:.2f}ms: Function '{name}' executed (took {exec_ms:.2f}ms)"
                 )
-
-            serialized_output = Serializer.json_dumps(function_output)
 
             self.invoke_async_funct(
                 module_name="ai_agent_core_engine",
                 class_name="AIAgentCoreEngine",
                 function_name="async_insert_update_tool_call",
                 **{
-                    "tool_call_id": function_call_data["id"],
+                    "tool_call_id": tool_call_id,
                     "content": serialized_output,
                     "status": "completed",
                 },
@@ -603,12 +623,17 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
         except Exception as e:
             log = traceback.format_exc()
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(
+                    f"[TOOL_RESULT] id={tool_call_id} name={name} status=failed "
+                    f"error={e!r}"
+                )
             self.invoke_async_funct(
                 module_name="ai_agent_core_engine",
                 class_name="AIAgentCoreEngine",
                 function_name="async_insert_update_tool_call",
                 **{
-                    "tool_call_id": function_call_data["id"],
+                    "tool_call_id": tool_call_id,
                     "arguments": arguments_json,
                     "status": "failed",
                     "notes": log,
