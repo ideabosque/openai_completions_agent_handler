@@ -118,6 +118,14 @@
             "description": "Passthrough object for provider-specific extensions (e.g., SGLang chat_template_kwargs, separate_reasoning).",
             "additionalProperties": true
         },
+        "enable_thinking": {
+            "type": "boolean",
+            "description": "SGLang/Qwen3 shorthand: when true, the handler adds chat_template_kwargs.enable_thinking=true to extra_body. Overridden by any value the caller sets explicitly in extra_body."
+        },
+        "separate_reasoning": {
+            "type": "boolean",
+            "description": "SGLang shorthand: when true, the handler adds separate_reasoning=true to extra_body so the server splits reasoning into the reasoning_content field. Overridden by any value the caller sets explicitly in extra_body."
+        },
         "instructions_role": {
             "type": "string",
             "enum": ["system", "developer", "user"],

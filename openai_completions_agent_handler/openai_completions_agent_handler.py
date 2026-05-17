@@ -81,6 +81,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         if tool.get("function", {}).get("name") in enabled_set
                     ]
 
+            self._assemble_extra_body(config)
+
             self.model_setting = {}
             for k, v in config.items():
                 if k in [
@@ -94,6 +96,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "max_retries",
                     "max_tool_call_depth",
                     "instructions_role",
+                    "enable_thinking",
+                    "separate_reasoning",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -207,6 +211,43 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             f"latency_ms={latency_str} finish_reason={finish_reason} "
             f"retry_count={retry_count}"
         )
+
+    def _assemble_extra_body(self, config: Dict[str, Any]) -> None:
+        """
+        Convert SGLang/Qwen3 shorthand config keys into the nested `extra_body`
+        structure that chat.completions.create() expects.
+
+        Recognized shorthand keys (top-level in `configuration`):
+            enable_thinking    -> extra_body["chat_template_kwargs"]["enable_thinking"]
+            separate_reasoning -> extra_body["separate_reasoning"]
+
+        Anything the caller has already placed in `extra_body` wins; this method
+        only fills missing slots so users can always override by setting
+        `extra_body` directly.
+        """
+        shorthand: Dict[str, Any] = {}
+        if "enable_thinking" in config and config["enable_thinking"] is not None:
+            shorthand["chat_template_kwargs"] = {
+                "enable_thinking": bool(config["enable_thinking"])
+            }
+        if "separate_reasoning" in config and config["separate_reasoning"] is not None:
+            shorthand["separate_reasoning"] = bool(config["separate_reasoning"])
+
+        if not shorthand:
+            return
+
+        explicit = config.get("extra_body") or {}
+        merged: Dict[str, Any] = dict(shorthand)
+        for k, v in explicit.items():
+            if (
+                k == "chat_template_kwargs"
+                and isinstance(v, dict)
+                and isinstance(merged.get(k), dict)
+            ):
+                merged[k] = {**merged[k], **v}
+            else:
+                merged[k] = v
+        config["extra_body"] = merged
 
     def _merge_instructions_into_first_user(
         self, messages: List[Dict[str, Any]], instructions: str
