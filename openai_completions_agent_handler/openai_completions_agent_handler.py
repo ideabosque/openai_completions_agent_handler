@@ -4,14 +4,12 @@ from __future__ import annotations
 
 __author__ = "bibow"
 
-import base64
 import json
 import logging
 import re
 import threading
 import traceback
 from decimal import Decimal
-from io import BytesIO
 from queue import Queue
 from typing import Any, Dict, List, Optional, Union
 
@@ -210,6 +208,26 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             f"retry_count={retry_count}"
         )
 
+    def _merge_instructions_into_first_user(
+        self, messages: List[Dict[str, Any]], instructions: str
+    ) -> List[Dict[str, Any]]:
+        merged = list(messages)
+        for i, msg in enumerate(merged):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                merged[i] = {**msg, "content": f"{instructions}\n\n{content}"}
+            elif isinstance(content, list):
+                merged[i] = {
+                    **msg,
+                    "content": [{"type": "text", "text": instructions}] + content,
+                }
+            else:
+                merged[i] = {**msg, "content": instructions}
+            return merged
+        return [{"role": "user", "content": instructions}] + merged
+
     def invoke_model(self, **kwargs: Dict[str, Any]) -> Any:
         try:
             if self.enable_timeline_log:
@@ -222,9 +240,14 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if instructions and not (
                 messages and messages[0].get("role") in {"system", "developer"}
             ):
-                messages = [
-                    {"role": self.instructions_role, "content": instructions}
-                ] + messages
+                if self.instructions_role == "user":
+                    messages = self._merge_instructions_into_first_user(
+                        messages, instructions
+                    )
+                else:
+                    messages = [
+                        {"role": self.instructions_role, "content": instructions}
+                    ] + messages
             payload["messages"] = messages
 
             if payload.get("stream"):
@@ -270,7 +293,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         input_messages: List[Dict[str, Any]],
         queue: Queue = None,
         stream_event: threading.Event = None,
-        input_files: Optional[List[Dict[str, Any]]] = None,
         model_setting: Dict[str, Any] = None,
     ) -> Optional[str]:
         if self.enable_timeline_log:
@@ -309,16 +331,10 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 return None
 
             stream = True if queue is not None else False
-            input_files = input_files or []
 
             if model_setting:
                 self.model_setting.update(model_setting)
                 self._tools_cache_valid = False
-
-            if input_files:
-                input_messages = self._process_input_files(input_files, input_messages)
-
-            self._process_user_file_ids(input_messages[:-1])
 
             if (
                 self.enable_timeline_log
@@ -391,51 +407,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             trimmed = trimmed[1:]
 
         return instructions + trimmed
-
-    def _process_input_files(
-        self, input_files: List[Dict[str, Any]], input_messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        image_urls = []
-        for input_file in input_files:
-            if "encoded_image" in input_file:
-                image_urls.append(
-                    f"data:image/jpeg;base64,{input_file['encoded_image']}"
-                )
-                continue
-            if "image_url" in input_file:
-                url = input_file["image_url"]
-                if not url.startswith(("http://", "https://", "data:")):
-                    if self.logger and self.logger.isEnabledFor(logging.WARNING):
-                        self.logger.warning(
-                            f"Rejecting non-http image URL scheme: {url[:40]}"
-                        )
-                    continue
-                image_urls.append(url)
-                continue
-
-            file_data = dict(input_file, purpose="user_data")
-            uploaded_file = self.insert_file(**file_data)
-            self.uploaded_files.append({"file_id": uploaded_file["id"]})
-
-        if image_urls and input_messages and input_messages[-1].get("role") == "user":
-            content = input_messages[-1].get("content", "")
-            message_content = (
-                [{"type": "text", "text": content}]
-                if isinstance(content, str) and content
-                else []
-            )
-            if isinstance(content, list):
-                message_content = list(content)
-            for image_url in image_urls:
-                message_content.append(
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                )
-            input_messages[-1]["content"] = message_content
-
-        return input_messages
-
-    def _process_user_file_ids(self, input_messages: List[Dict[str, Any]]) -> None:
-        pass
 
     def handle_function_call(
         self,

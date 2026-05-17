@@ -58,7 +58,6 @@ def ask_model(
     input_messages: List[Dict[str, Any]],
     queue: Queue = None,
     stream_event: threading.Event = None,
-    input_files: Optional[List[Dict[str, Any]]] = None,
     model_setting: Dict[str, Any] = None,
 ) -> Optional[str]: ...
 
@@ -231,22 +230,6 @@ with OpenAICompletionsEventHandler(logger=None, agent=weather_agent) as handler:
         })
 ```
 
-### Image Input
-
-Pass image inputs through `ask_model(input_files=...)`. Accepted shapes:
-
-```python
-handler.ask_model(
-    input_messages=[{"role": "user", "content": "Describe this picture."}],
-    input_files=[
-        {"encoded_image": "<base64 of jpeg/png>"},   # converted to data: URL
-        {"image_url": "https://example.com/cat.png"} # passed through as-is
-    ],
-)
-```
-
-Schemes other than `http://`, `https://`, and `data:` are rejected at the boundary. `https:` URLs are fetched by the model provider, not by this handler — see the security note below.
-
 ---
 
 ## Key Differences from `openai_agent_handler`
@@ -268,7 +251,6 @@ Schemes other than `http://`, `https://`, and `data:` are rejected at the bounda
 
 - `openai_api_key` is never logged. The handler runs a regex-based redaction over error messages before logging them.
 - Tool arguments and message bodies may contain user PII. The default `INFO` log line includes only metadata (model, request id, tokens, latency, finish reason); avoid raising the log level in production.
-- `https:` image URLs are passed verbatim to the model provider, which fetches them. If your provider is in a trusted network, this expands its outbound surface — consider rewriting URLs through a content proxy you control if that matters.
 
 ---
 

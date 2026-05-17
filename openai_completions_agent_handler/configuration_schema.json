@@ -120,9 +120,9 @@
         },
         "instructions_role": {
             "type": "string",
-            "enum": ["system", "developer"],
+            "enum": ["system", "developer", "user"],
             "default": "system",
-            "description": "Role to use for the instructions message. Use 'developer' for newer OpenAI models; 'system' is universally accepted."
+            "description": "Where to put the agent's instructions. 'system' (default) emits a leading system message; 'developer' is for newer OpenAI models; 'user' merges the instructions into the first user message and is required for models like Gemma whose chat templates reject the system role."
         },
         "response_format": {
             "type": "object",
