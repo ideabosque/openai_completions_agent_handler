@@ -1,0 +1,233 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "OpenAI Completions Configuration Schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "model",
+        "openai_api_key"
+    ],
+    "definitions": {
+        "paramSchema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["string", "number", "integer", "boolean", "object", "array"]
+                },
+                "description": {"type": "string"},
+                "properties": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/definitions/paramSchema"}
+                },
+                "items": {"$ref": "#/definitions/paramSchema"},
+                "required": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        },
+        "toolParameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "properties"],
+            "properties": {
+                "type": {"const": "object"},
+                "properties": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/definitions/paramSchema"}
+                },
+                "required": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        }
+    },
+    "properties": {
+        "model": {
+            "type": "string",
+            "description": "ID of the model that will generate the response (e.g., gpt-4.1, gpt-4o, gpt-5, Qwen/Qwen3-4B)."
+        },
+        "openai_api_key": {
+            "type": "string",
+            "description": "The API Key of OpenAI. Use 'EMPTY' for SGLang/vLLM servers that do not require authentication."
+        },
+        "base_url": {
+            "type": "string",
+            "description": "Optional custom base URL for OpenAI-compatible servers (e.g., http://127.0.0.1:30000/v1 for SGLang)."
+        },
+        "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard cap on tokens in the model's reply. Legacy field; prefer max_completion_tokens for newer models."
+        },
+        "max_completion_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard cap on completion tokens. Preferred over max_tokens for newer OpenAI models. If both are set, this takes precedence."
+        },
+        "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.8,
+            "description": "Sampling temperature; higher values increase randomness."
+        },
+        "top_p": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1.0,
+            "description": "Nucleus sampling probability threshold."
+        },
+        "presence_penalty": {
+            "type": "number",
+            "minimum": -2,
+            "maximum": 2,
+            "default": 0,
+            "description": "Penalty for repeating tokens already in the conversation."
+        },
+        "frequency_penalty": {
+            "type": "number",
+            "minimum": -2,
+            "maximum": 2,
+            "default": 0,
+            "description": "Penalty for repeating the same tokens frequently."
+        },
+        "seed": {
+            "type": "integer",
+            "description": "Seed for deterministic sampling. Supported by OpenAI and SGLang."
+        },
+        "stop": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "maxItems": 4}
+            ],
+            "description": "Stop sequences to halt generation."
+        },
+        "logit_bias": {
+            "type": "object",
+            "description": "Token ID to bias value mapping (-100 to 100). Supported by SGLang.",
+            "additionalProperties": {"type": "number"}
+        },
+        "extra_body": {
+            "type": "object",
+            "description": "Passthrough object for provider-specific extensions (e.g., SGLang chat_template_kwargs, separate_reasoning).",
+            "additionalProperties": true
+        },
+        "instructions_role": {
+            "type": "string",
+            "enum": ["system", "developer"],
+            "default": "system",
+            "description": "Role to use for the instructions message. Use 'developer' for newer OpenAI models; 'system' is universally accepted."
+        },
+        "response_format": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Controls structured output formatting.",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["json_object", "json_schema", "text"]
+                },
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "schema": {"type": "object"}
+                    }
+                }
+            }
+        },
+        "tools": {
+            "type": "array",
+            "description": "Function declarations compatible with OpenAI Chat Completions API.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "function"],
+                "properties": {
+                    "type": {"const": "function"},
+                    "function": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "parameters": {"$ref": "#/definitions/toolParameters"}
+                        },
+                        "required": ["name", "parameters"]
+                    }
+                }
+            }
+        },
+        "tool_choice": {
+            "oneOf": [
+                {
+                    "type": "string",
+                    "enum": ["auto", "none", "required"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": {"const": "function"},
+                        "function": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"]
+                        }
+                    },
+                    "required": ["type", "function"]
+                }
+            ]
+        },
+        "parallel_tool_calls": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether to allow the model to call multiple tools in parallel."
+        },
+        "enabled_tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Subset of tool names to enable. Other tools are filtered out at initialization."
+        },
+        "max_retries": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 2,
+            "description": "Maximum number of SDK-level retries for transient errors (rate limit, timeout, connection). Applied to the OpenAI client, not empty-response retries."
+        },
+        "request_timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "default": 120.0,
+            "description": "Total request timeout in seconds for the httpx client."
+        },
+        "connect_timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "default": 10.0,
+            "description": "Connection timeout in seconds for the httpx client."
+        },
+        "pool_max_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 20,
+            "description": "Maximum number of connections in the httpx pool."
+        },
+        "pool_max_keepalive_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 10,
+            "description": "Maximum number of keep-alive connections in the httpx pool."
+        },
+        "max_tool_call_depth": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 8,
+            "description": "Maximum recursion depth for tool-call chains. Exceeding this raises ToolCallDepthExceeded."
+        }
+    }
+}
