@@ -834,6 +834,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
             if getattr(delta, "content", None):
                 received_any_content = True
+                print(delta.content, end="", flush=True)
                 accumulated_text_parts.append(delta.content)
 
                 if output_format in ["json_object", "json_schema"]:
@@ -859,6 +860,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
             reasoning_content = getattr(delta, "reasoning_content", None)
             if reasoning_content and isinstance(reasoning_content, str):
+                print(reasoning_content, end="", flush=True)
                 accumulated_reasoning_parts.append(reasoning_content)
 
             if getattr(delta, "tool_calls", None):
