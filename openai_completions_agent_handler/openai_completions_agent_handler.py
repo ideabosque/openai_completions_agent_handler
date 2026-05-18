@@ -438,6 +438,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
     def _trim_messages_for_recursion(
         self, input_messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
+        # Only a leading system/developer message is preserved here.
+        # For instructions_role="user" (Gemma family), instructions are NOT in
+        # input_messages — they are merged into the first user message inside
+        # invoke_model on every request — so there is nothing to preserve at the
+        # head and the window can safely slide over all user/assistant/tool turns.
         max_messages = self.agent.get("num_of_messages")
         if not max_messages or len(input_messages) <= max_messages:
             return input_messages
@@ -455,35 +460,59 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
         return instructions + trimmed
 
-    def handle_function_call(
+    def handle_function_calls(
         self,
-        tool_call: Dict[str, Any],
+        tool_calls: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        if self.enable_timeline_log:
-            function_call_start = pendulum.now("UTC")
+        """
+        Execute a batch of tool_calls that came back from a single model turn.
 
-        if not tool_call or "id" not in tool_call:
-            raise ValueError("Invalid tool_call object")
-        if not tool_call.get("function", {}).get("name"):
-            raise ValueError("Tool call missing function name")
+        Chat Completions requires one assistant message containing ALL of the
+        turn's tool_calls, followed by one `role:"tool"` result per call —
+        emitting separate assistant messages per call is rejected by stricter
+        provider templates.
+        """
+        if not tool_calls:
+            return input_messages
+
+        validated = []
+        for tc in tool_calls:
+            if not tc or "id" not in tc:
+                raise ValueError("Invalid tool_call object")
+            if not tc.get("function", {}).get("name"):
+                raise ValueError("Tool call missing function name")
+            validated.append(
+                {
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"].get("arguments", "{}"),
+                    "type": "function",
+                }
+            )
+
+        self._append_assistant_with_tool_calls(validated, input_messages)
+
+        for fcd in validated:
+            self._execute_and_append_result(fcd, input_messages)
+
+        return input_messages
+
+    def _execute_and_append_result(
+        self,
+        function_call_data: Dict[str, Any],
+        input_messages: List[Dict[str, Any]],
+    ) -> None:
+        if self.enable_timeline_log:
+            call_start = pendulum.now("UTC")
 
         try:
-            function_call_data = {
-                "id": tool_call["id"],
-                "name": tool_call["function"]["name"],
-                "arguments": tool_call["function"].get("arguments", "{}"),
-                "type": "function",
-            }
-
             arguments = self._process_function_arguments(function_call_data)
-
             function_output, serialized_output = self._execute_function(
                 function_call_data, arguments
             )
-
-            self._update_conversation_history(
-                function_call_data, function_output, input_messages, serialized_output
+            self._append_tool_result(
+                function_call_data["id"], serialized_output, input_messages
             )
 
             if self._run is None:
@@ -494,9 +523,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                             "content": Serializer.json_dumps(
                                 {
                                     "tool": {
-                                        "tool_call_id": tool_call["id"],
+                                        "tool_call_id": function_call_data["id"],
                                         "tool_type": "function",
-                                        "name": tool_call["function"]["name"],
+                                        "name": function_call_data["name"],
                                         "arguments": arguments,
                                     },
                                     "output": function_output,
@@ -512,19 +541,19 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 and self.logger
                 and self.logger.isEnabledFor(logging.INFO)
             ):
-                function_call_time = (
-                    pendulum.now("UTC") - function_call_start
+                call_ms = (
+                    pendulum.now("UTC") - call_start
                 ).total_seconds() * 1000
                 elapsed = self._get_elapsed_time()
                 self.logger.info(
-                    f"[TIMELINE] T+{elapsed:.2f}ms: Function '{function_call_data['name']}' complete (took {function_call_time:.2f}ms)"
+                    f"[TIMELINE] T+{elapsed:.2f}ms: Function '{function_call_data['name']}' complete (took {call_ms:.2f}ms)"
                 )
-
-            return input_messages
 
         except Exception as e:
             if self.logger and self.logger.isEnabledFor(logging.ERROR):
-                self.logger.error(f"Error in handle_function_call: {e}")
+                self.logger.error(
+                    f"Error executing tool {function_call_data['name']}: {e}"
+                )
             raise
 
     def _process_function_arguments(
@@ -642,38 +671,42 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             error_msg = f"Function execution failed: {e}"
             return error_msg, Serializer.json_dumps(error_msg)
 
-    def _update_conversation_history(
+    def _append_assistant_with_tool_calls(
         self,
-        function_call_data: Dict[str, Any],
-        function_output: Any,
+        function_call_data_list: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
-        serialized_output: Optional[str] = None,
     ) -> None:
+        """Append ONE assistant message containing every tool_call from this turn."""
         input_messages.append(
             {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
                     {
-                        "id": function_call_data["id"],
+                        "id": fcd["id"],
                         "type": "function",
                         "function": {
-                            "name": function_call_data["name"],
-                            "arguments": function_call_data.get("arguments", "{}"),
+                            "name": fcd["name"],
+                            "arguments": fcd.get("arguments", "{}"),
                         },
                     }
+                    for fcd in function_call_data_list
                 ],
             }
         )
+
+    def _append_tool_result(
+        self,
+        tool_call_id: str,
+        content: str,
+        input_messages: List[Dict[str, Any]],
+    ) -> None:
+        """Append one role:'tool' result message bound to its parent tool_call_id."""
         input_messages.append(
             {
                 "role": "tool",
-                "tool_call_id": function_call_data["id"],
-                "content": (
-                    serialized_output
-                    if serialized_output is not None
-                    else Serializer.json_dumps(function_output)
-                ),
+                "tool_call_id": tool_call_id,
+                "content": content,
             }
         )
 
@@ -711,17 +744,19 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self.final_output["reasoning_summary"] = reasoning_content
 
         if tool_calls:
-            for tool_call in tool_calls:
-                input_messages = self.handle_function_call(
+            input_messages = self.handle_function_calls(
+                [
                     {
-                        "id": tool_call.id,
+                        "id": tc.id,
                         "function": {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
                         },
-                    },
-                    input_messages,
-                )
+                    }
+                    for tc in tool_calls
+                ],
+                input_messages,
+            )
             input_messages = self._trim_messages_for_recursion(input_messages)
             self.ask_model(input_messages)
             return response.id
@@ -857,10 +892,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         }
                         for acc in tool_call_accumulators.values()
                     ]
-                    for tool_call in tool_calls:
-                        input_messages = self.handle_function_call(
-                            tool_call, input_messages
-                        )
+                    input_messages = self.handle_function_calls(
+                        tool_calls, input_messages
+                    )
                     input_messages = self._trim_messages_for_recursion(input_messages)
                     self.ask_model(
                         input_messages, queue=queue, stream_event=stream_event
