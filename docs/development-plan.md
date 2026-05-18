@@ -1,55 +1,84 @@
-# OpenAI Completions Agent Handler - Development Plan
+# OpenAI Completions Agent Handler Development Plan
 
 ## 1. Purpose
 
-`OpenAICompletionsEventHandler` is a SilvaEngine event handler for OpenAI-compatible Chat Completions APIs. It uses `client.chat.completions.create()` instead of the newer Responses API so the same handler can run against OpenAI, SGLang, vLLM, LiteLLM, and other servers that expose the standard Chat Completions surface.
+`OpenAICompletionsEventHandler` is a SilvaEngine event handler for OpenAI-compatible Chat Completions APIs. It intentionally calls `client.chat.completions.create()` rather than the newer Responses API so the same handler can run against OpenAI, SGLang, vLLM, LiteLLM, and other providers that expose the standard Chat Completions surface.
 
-The project goal is a production-ready synchronous handler that can:
+The v1 goal is a production-ready synchronous handler that can:
 
 - Build valid Chat Completions `messages` payloads from SilvaEngine agent inputs.
-- Support text, image URL/data URL inputs, function tools, streaming, and non-streaming output.
-- Continue conversations after tool calls using the Chat Completions assistant/tool message format.
-- Pass provider-specific options through `extra_body` without polluting core control flow.
-- Remain deterministic under tests without requiring real OpenAI credentials or network access.
+- Inject the agent's `instructions` per request as a `system`, `developer`, or merged-into-first-user message.
+- Support text input, caller-supplied Chat Completions content arrays, function tools, streaming, and non-streaming output.
+- Continue conversations after tool calls using strict Chat Completions assistant/tool history, including the single-assistant batched shape for parallel tool calls.
+- Pass provider-specific options through `extra_body`, with shorthand support for `enable_thinking` and `separate_reasoning`.
+- Provide predictable resource cleanup through `close()` and context-manager usage.
+- Emit structured `[MODEL_CALL]`, `[TOOL_CALL]`, and `[TOOL_RESULT]` log lines for production observability.
+- Stay deterministic under local tests without OpenAI credentials, live model calls, or network access.
 
 ## 2. Current Project Assessment
 
-Current implementation status, based on the repository state:
+The core handler is substantially implemented. A deterministic unit suite and two interactive smoke scripts exist locally under `openai_completions_agent_handler/tests`, but that directory is intentionally ignored by `.gitignore` for now and is not tracked by Git. Treat those tests as local validation assets, not release artifacts.
 
-- Package metadata, schema, README, implementation module, and deterministic tests exist.
-- The handler already initializes an `httpx.Client`, creates an OpenAI SDK client, filters enabled tools, applies `max_completion_tokens` precedence, and exposes `close()` plus context manager support.
-- Non-streaming response handling, streaming response handling, tool-call continuation, message trimming, image content-array conversion, file helpers, and basic logging are implemented.
-- The test suite covers many expected v1 behaviors, but it cannot currently run in a clean environment unless dependencies such as `openai` are installed.
-- The README has mojibake/encoding artifacts in headings and icons. That should be cleaned before release because it lowers package quality even if the code works.
+### Implemented
 
-The previous plan was technically useful but read like a first-build implementation spec. This revised plan treats the project as partially implemented and focuses on getting it to a reliable v1 release.
+- Pooled `httpx.Client` with explicit timeouts and limits.
+- OpenAI SDK client construction with `base_url`, `api_key`, and SDK-level `max_retries`.
+- `close()` and context-manager (`__enter__` / `__exit__`) for resource cleanup.
+- `enabled_tools` filtering at construction time.
+- `max_completion_tokens` precedence over `max_tokens` with a warning.
+- `_assemble_extra_body()` shorthand merge for `enable_thinking` and `separate_reasoning`; explicit `extra_body` values win.
+- `_merge_instructions_into_first_user()` for `instructions_role="user"`, useful for Gemma-family chat templates that reject system messages.
+- `invoke_model(**kwargs)` with inline payload assembly, instruction injection, `stream_options` handling, and `_omit_none()` cleanup.
+- Non-streaming `handle_response()` for text, tool calls, `length`, `content_filter`, empty-response retries, and `reasoning_content`.
+- Streaming `handle_stream()` with text accumulation, tool-call delta stitching by `index`, usage-only chunks, reasoning deltas, and finish-reason handling.
+- Live stream rendering through `print(delta.content, end="", flush=True)` for local development.
+- `handle_function_calls()` appends one assistant message containing all tool calls from a model turn, then appends one tool result per call.
+- `_append_assistant_with_tool_calls()` and `_append_tool_result()` as focused history helpers.
+- `[MODEL_CALL]`, `[TOOL_CALL]`, and `[TOOL_RESULT]` INFO logs with bounded argument/output previews.
+- `ToolCallDepthExceeded` for bounded recursion.
+- `_trim_messages_for_recursion()` with a leading-tool guard and explicit handling for `instructions_role="user"`.
+- API-key redaction through `_redact_api_key()`.
+- SDK exception propagation: `invoke_model()` and `ask_model()` re-raise `openai.APIError` subclasses and `ToolCallDepthExceeded` without wrapping.
+- Minimal image content-array helpers: `_validate_image_url()` and `_build_image_message()`.
 
-## 3. Scope
+### Known Gaps Before v1
 
-### In Scope for v1
+- **Tests are intentionally local-only for now.** `openai_completions_agent_handler/tests` exists on disk, but `git ls-files` does not include it and `.gitignore` intentionally ignores `tests/`. The README Quick Start should not imply that a fresh clone from tracked files alone can run `openai_completions_agent_handler.tests.test_deterministic` unless the tests are distributed through another documented path.
+- **`_short_term_memory` writes assume `self.agent["tool_call_role"]`.** That key is read from the top-level agent dict, not `configuration`, and is not covered by `configuration_schema.json`.
+- **Test coverage is partial.** The local deterministic suite now covers exception propagation, image helpers, `_assemble_extra_body` deep merge, `_merge_instructions_into_first_user` shapes, `handle_function_calls()` parallel batching, and `[MODEL_CALL]` / `[TOOL_CALL]` / `[TOOL_RESULT]` log emission shape. Remaining gaps: split streaming tool-call chunks across more than two delta arrivals, final usage-only stream chunk with empty `choices`, and end-to-end recursion-depth lifecycle that walks through more than one tool call before hitting the cap.
+- **Interactive smoke tests rely on env-driven config.** `.env.example` documents the local-provider defaults, but Gemma's required `instructions_role="user"` is easy to miss.
+- **Dependency install path is fragile.** `pyproject.toml` depends on `AI-Agent-Handler` and `SilvaEngine-Utility`, while the README Quick Start mentions `AI-Agent-Handler` and `ai_agent_core_engine`. The docs should identify the complete dependency source of truth.
+- **Packaging includes broad package discovery.** `tool.setuptools.packages.find.include = ["*"]` can accidentally include generated or unrelated package directories.
 
-- Synchronous `OpenAICompletionsEventHandler` only.
+## 3. v1 Scope
+
+### In Scope
+
+- Synchronous `OpenAICompletionsEventHandler`.
 - Chat Completions request construction and invocation.
-- Streaming and non-streaming response handling.
-- Function tool calls and recursive model continuation after tool results.
-- Image input via Chat Completions content arrays using `image_url` parts.
-- Provider extension passthrough through `extra_body`.
-- File helper methods where compatible with the OpenAI SDK file API.
-- Deterministic unit tests using mocked clients and mocked stream chunks.
-- README, schema, and examples aligned with the actual implementation.
+- Streaming and non-streaming response handling, including live stdout chunk rendering for local development.
+- Function tool calls, including batched assistant `tool_calls` for parallel tool calls, and recursive continuation after tool results.
+- Three instruction-injection modes: leading `system`, leading `developer`, and merged-into-first-user.
+- Caller-supplied multimodal Chat Completions content arrays, plus `_build_image_message()` as a small convenience helper for `http`, `https`, and `data` image URLs.
+- Provider extension passthrough through `extra_body`, plus shorthand keys for common SGLang/Qwen thinking settings.
+- Explicit configuration behavior documented by `configuration_schema.json`.
+- Local deterministic tests using mocked clients and mocked stream chunks.
+- README examples that match the actual constructor, configuration shape, and message formats.
+- Structured observability logging at INFO level.
 
-### Out of Scope for v1
+### Out of Scope
 
-These are Responses API or platform-specific capabilities and should remain in the sibling Responses-based handler:
+These are Responses API or platform-specific capabilities and remain in the sibling Responses-based handler:
 
-- Native `web_search`, `code_interpreter`, MCP tools, and MCP approval flows.
+- Native `web_search`, `code_interpreter`, MCP-as-native-tools, and MCP approval flows.
 - Responses API item formats such as `function_call_output`.
-- Container file citations or `get_output_file()` backed by container endpoints.
+- Container file citations or `get_output_file()` backed by OpenAI container endpoints.
 - Server-side conversation state.
 - Async `AsyncOpenAI` support or async streaming.
 
-### Deferred Enhancements
+### Not Included in v1
 
+- File-driven image ingestion: `_process_input_files`, `_process_user_file_ids`, an `input_files` parameter on `ask_model`, file upload helpers, and automatic local-file-to-data-URL conversion.
 - Audio input/output.
 - Inline PDF or arbitrary file content parts.
 - `n > 1` candidate sampling.
@@ -59,27 +88,34 @@ These are Responses API or platform-specific capabilities and should remain in t
 
 ## 4. API Contract
 
-The handler must follow Chat Completions semantics exactly:
+The handler must remain aligned with Chat Completions semantics:
 
-| Area | Required Chat Completions Behavior |
+| Area | Required Behavior |
 |---|---|
 | SDK call | `client.chat.completions.create()` |
 | Request input | `messages`, not `input` |
-| Assistant tool call | Assistant message with `tool_calls` |
-| Tool result | `{"role": "tool", "tool_call_id": "...", "content": "..."}` |
-| Tool-call assistant content | `content: None`, not an empty string |
-| Streaming text | `choices[0].delta.content` |
+| Multimodal input | Caller-supplied content arrays, for example text parts plus `image_url` parts |
+| Assistant tool call | One assistant message with `content: None` and `tool_calls` containing all tool calls from the model turn |
+| Tool result | One `{"role": "tool", "tool_call_id": "...", "content": "..."}` message per tool call |
+| Streaming text | Read `choices[0].delta.content` |
 | Streaming tools | Stitch `choices[0].delta.tool_calls` by `index` |
-| Usage in streams | Handle final usage-only chunks where `choices == []` |
+| Usage in streams | Handle usage-only chunks where `choices == []` |
 | Conversation state | Caller-managed message history only |
 
-Provider compatibility depends on clean payloads. Optional values must be omitted when unset, and tool-related options must only be sent when tools are present.
+Payload hygiene is part of the contract:
+
+- `_omit_none()` strips `None` values before the SDK call.
+- `stream_options` is injected only when `stream=True`.
+- `tools`, `tool_choice`, and `parallel_tool_calls` are removed when the filtered tool list is empty.
+- Image helper URLs are limited to `http`, `https`, and `data` schemes; no local file paths are read by the handler.
+- Provider-specific parameters belong in `extra_body`.
+- Tool-call continuation must preserve the assistant tool-call message and all matching tool result messages as a complete group.
 
 ## 5. Configuration Design
 
-`configuration_schema.json` should remain the source of truth for supported configuration fields.
+`configuration_schema.json` is the source of truth for supported configuration fields.
 
-Required core fields:
+Required fields:
 
 - `model`
 - `openai_api_key`
@@ -87,222 +123,229 @@ Required core fields:
 Important optional fields:
 
 - `base_url`
-- `temperature`
-- `top_p`
-- `max_tokens`
-- `max_completion_tokens`
-- `presence_penalty`
-- `frequency_penalty`
-- `tools`
-- `tool_choice`
-- `parallel_tool_calls`
+- `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`
+- `max_tokens`, `max_completion_tokens`
+- `tools`, `tool_choice`, `parallel_tool_calls`
 - `response_format`
-- `stop`
-- `seed`
-- `logit_bias`
-- `stream_options`
-- `instructions_role`
+- `stop`, `seed`, `logit_bias`
+- `instructions_role`: `"system"` (default), `"developer"`, or `"user"`
 - `enabled_tools`
 - `extra_body`
-- `request_timeout_seconds`
-- `connect_timeout_seconds`
+- `enable_thinking`, `separate_reasoning`
+- `request_timeout_seconds`, `connect_timeout_seconds`
 - `max_retries`
-- `pool_max_connections`
-- `pool_max_keepalive_connections`
+- `pool_max_connections`, `pool_max_keepalive_connections`
 - `max_tool_call_depth`
 
 Configuration rules:
 
-- If both `max_tokens` and `max_completion_tokens` are configured, prefer `max_completion_tokens` and log a warning.
-- `instructions_role` must be explicit configuration, defaulting to `system`. Do not infer `developer` from model names.
-- Provider-specific settings must live under `extra_body`.
-- Never log `openai_api_key`.
-- Avoid logging full message bodies or full tool arguments at INFO level.
+- If both `max_tokens` and `max_completion_tokens` are configured, keep `max_completion_tokens`, remove `max_tokens`, and log a warning.
+- `instructions_role="user"` prepends instructions to the first user message at payload-build time instead of storing instructions in history.
+- Provider-specific settings must live under `extra_body`. The shorthand keys `enable_thinking` and `separate_reasoning` populate `extra_body`, and explicit `extra_body` values win.
+- `openai_api_key` is never logged.
+- Tool arguments and full message bodies must not be logged at INFO level by default.
+- `stream_options` is not user-facing configuration.
 
-## 6. v1 Completion Roadmap
+## 6. Provider Compatibility Notes
 
-### Phase 1 - Dependency and Test Harness Cleanup
+### OpenAI
 
-Goal: make local validation predictable.
+- Use the default SDK `base_url` by omitting `base_url`.
+- Prefer `max_completion_tokens` for newer models.
+- Use `instructions_role="system"` unless the target model requires `developer`.
+- Responses-only features are intentionally unsupported in this handler.
 
-Tasks:
+### vLLM
 
-- Add a documented install/test command to the README.
-- Ensure test dependencies are declared through packaging metadata or a clearly documented dev install path.
-- Decide whether tests should run with `python -m unittest ...` or a pytest entrypoint, then document one official path.
-- Remove committed `__pycache__` artifacts from the package tree and keep them ignored.
+- Launch: `vllm serve <model> [--api-key token-abc123] [--chat-template ./template.jinja]`
+- Base URL: `http://localhost:8000/v1`
+- Authentication is optional for local servers.
+- Provider-specific parameters should pass through `extra_body`.
+- Models without a tokenizer chat template need `--chat-template`.
+- Image input: supports the standard `image_url` content-part format used by `ask_model(input_images=...)`, but documented as **one image per message** on stable releases. Multi-image support is version-dependent; confirm against your vLLM build before sending more than one URL per turn.
 
-Acceptance gate:
+References: [vLLM OpenAI-Compatible Server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server/), [vLLM Multimodal Inputs](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
 
-- A fresh checkout can install dependencies and run deterministic tests without real API credentials.
+### SGLang
 
-### Phase 2 - Payload and Invocation Hardening
+- Launch example: `python3 -m sglang.launch_server --model-path Qwen/Qwen3-4B --tool-call-parser qwen --reasoning-parser qwen3`
+- Base URL: `http://127.0.0.1:30000/v1`
+- Use `openai_api_key="EMPTY"` for local servers that skip auth.
+- For reasoning support, set `enable_thinking=true` and `separate_reasoning=true`, or set `extra_body.chat_template_kwargs` directly.
+- Function calling requires a matching `--tool-call-parser`; otherwise tool calls may arrive as raw text.
+- Gemma-family models should use `instructions_role="user"` and should be treated as chat-only through SGLang unless tool support is explicitly confirmed for that stack.
+- Image input: supports the standard `image_url` content-part format, including multiple image parts per message in recent versions. Requires launching with a vision-capable model (`Qwen/Qwen2.5-VL-7B-Instruct`, `Qwen/Qwen3-VL-*`, etc.); chat-only models will reject image content. Older builds had Qwen2.5-VL-72B parsing bugs (resolved upstream).
 
-Goal: make requests portable across OpenAI-compatible providers.
+References: [SGLang OpenAI API](https://docs.sglang.io/docs/basic_usage/openai_api), [SGLang Tool and Function Calling](https://docs.sglang.ai/advanced_features/function_calling.html), [SGLang OpenAI Vision API](https://docs.sglang.io/basic_usage/openai_api_vision.html)
 
-Tasks:
+### LiteLLM
 
-- Confirm `_build_request_payload()` omits unset optional values.
-- Only include `stream_options` when streaming.
-- Only include `tools`, `tool_choice`, and `parallel_tool_calls` when a non-empty tool list is present.
-- Pass `extra_body` through unchanged.
-- Re-raise SDK connection, timeout, and rate-limit exceptions without wrapping them in a generic exception that hides their type.
-- Log BadRequest context using safe metadata only: model, stream flag, has-tools, has-image, and configured response format.
+- Launch: `litellm --config <config.yaml>`
+- Base URL: `http://localhost:4000`
+- The handler treats LiteLLM as a standard OpenAI-compatible endpoint; provider-specific options pass through `extra_body`.
 
-Acceptance gate:
+## 7. v1 Roadmap
 
-- Exact-payload tests cover streaming, non-streaming, no-tools, tools, `extra_body`, and `response_format`.
+Done items are listed in section 2. The roadmap below contains open work.
 
-### Phase 3 - Message Construction and Trimming
+### Phase 1: Local Test Coverage and Documentation
 
-Goal: guarantee that generated message history is valid Chat Completions input.
-
-Tasks:
-
-- Ensure agent instructions are inserted as the first `system` or `developer` message when applicable.
-- Preserve existing assistant `tool_calls` and `role: "tool"` messages without rewriting IDs or order.
-- Build image messages as content arrays with text and `image_url` parts.
-- Reject unsupported image URL schemes at the boundary.
-- Strengthen trimming so it never leaves an orphan `tool` message or partial tool-call group.
-
-Acceptance gate:
-
-- Tests cover text-only messages, text-plus-image messages, preserved prior tool history, and trimming through multi-tool-call chains.
-
-### Phase 4 - Tool Call Lifecycle
-
-Goal: make function execution reliable and recoverable.
+Goal: keep the local deterministic suite current while documenting that it is not part of tracked release contents yet.
 
 Tasks:
 
-- Validate every tool call has an `id`, a function name, and parseable arguments before execution.
-- Parse JSON arguments exactly once.
-- Persist tool-call status as `in_progress`, then `completed` or `failed`.
-- Serialize tool outputs into string `content` before appending tool result messages.
-- Continue the model with assistant-with-`tool_calls` followed by matching `tool` messages.
-- Enforce `max_tool_call_depth` with `ToolCallDepthExceeded`.
+- Keep `openai_completions_agent_handler/tests` ignored for now.
+- Update the README Quick Start to make the local-test prerequisite explicit, or move the test command into a maintainer-only validation section.
+- Add streaming tests for tool-call deltas split across three or more chunks (single delta covered, multi-delta gap remains).
+- Add a test for the final usage-only stream chunk where `choices == []`.
+- Add an end-to-end recursion-depth lifecycle test that walks through one or more real tool-call rounds before hitting the cap.
+- Add a test that wrapped (non-API) exception messages do not leak the API key.
 
 Acceptance gate:
 
-- Tests prove successful tool calls, failed tool calls, malformed arguments, multi-tool ordering, and recursion depth limits.
+- Maintainer-local checkout with the ignored test bundle can run `python -m unittest openai_completions_agent_handler.tests.test_deterministic -v` without API credentials or network access.
+- README wording clearly distinguishes install instructions for package users from maintainer-local validation commands.
 
-### Phase 5 - Response Handling
+### Phase 2: Exception Propagation
 
-Goal: return clear final output in all supported finish states.
+Completed. `invoke_model()` and `ask_model()` now re-raise `openai.APIError` subclasses and `ToolCallDepthExceeded` without conversion. Unknown exceptions are still wrapped with redacted messages.
+
+### Phase 3: Packaging and Install Path
+
+Goal: a clean checkout can be installed and tested without insider knowledge.
 
 Tasks:
 
-- Handle finish reasons: `stop`, `tool_calls`, `length`, `content_filter`, deprecated `function_call`, and unknown values.
-- Capture `reasoning_content` defensively with `getattr`.
-- Mark truncated and filtered outputs on `final_output`.
-- Bound empty-response retries with a configurable or documented cap.
-- Preserve usage and provider request ID for observability.
+- Document where `AI-Agent-Handler`, `SilvaEngine-Utility`, and any runtime coupling to `ai_agent_core_engine` come from.
+- Update the README Quick Start so it matches `pyproject.toml` and the actual smoke-test dependencies.
+- Narrow `tool.setuptools.packages.find.include` so only `openai_completions_agent_handler*` is packaged.
+- Keep `.gitignore` hiding `tests/`, `.env`, caches, build output, and egg metadata.
+- Consider adding a `[project.optional-dependencies]` `dev` group for deterministic and smoke-test dependencies.
 
 Acceptance gate:
 
-- Tests cover text-only, tool-only, text-plus-tool, empty retry cap, reasoning content, truncation, filtering, and unknown finish reasons.
+- A fresh clone, following only README instructions, can install the package and run the deterministic tests.
 
-### Phase 6 - Streaming Reliability
+### Phase 4: Documentation Drift Cleanup
 
-Goal: make streaming behavior equivalent to non-streaming behavior.
+Goal: align README, development plan, schema, and code on the same source of truth.
 
 Tasks:
 
-- Accumulate text in lists and join once.
-- Send stream deltas to the queue in order.
-- Stitch streaming tool calls by `index`, including partial `id`, `function.name`, and `function.arguments`.
-- Handle usage-only chunks where `choices` is empty.
-- Finalize `stream_event` on all successful terminal paths.
-- For streaming JSON, emit raw deltas and parse the final accumulated text once.
+- Verify every documented config field appears in `configuration_schema.json` and vice versa.
+- Document the top-level `tool_call_role` agent key, or remove the direct dependency on it.
+- Add an "Observability" README section for `[MODEL_CALL]`, `[TOOL_CALL]`, and `[TOOL_RESULT]`.
+- Add a "Streaming" README section explaining stdout chunk rendering and any production streaming path.
+- Refresh the production checklist for `extra_body` shorthand, parallel tool calls, and handler cleanup.
 
 Acceptance gate:
 
-- Tests cover text streaming, JSON streaming, usage-only chunks, parallel tool-call stitching, partial JSON arguments, `length`, and `content_filter`.
+- A new contributor can read the README and schema and accurately predict runtime behavior for every documented field.
 
-### Phase 7 - Documentation and Release Polish
+### Phase 5: Release Polish
 
-Goal: make the project understandable and publishable.
+Goal: tag a v1 release.
 
 Tasks:
 
-- Fix README encoding artifacts.
-- Explain why the handler targets Chat Completions despite OpenAI's newer Responses API.
-- Provide minimal OpenAI, SGLang, vLLM/LiteLLM, function-tool, streaming, and image examples.
-- Document unsupported Responses-only features and point users to the sibling handler.
-- Add a production checklist: pin SDK versions, configure timeouts, set tool depth cap, redact logs, and close the handler.
-- Add troubleshooting notes for invalid tool-call history and provider-specific unsupported parameters.
+- Bump version in `pyproject.toml`.
+- Confirm all Phase 1-4 acceptance gates pass.
+- Run the manual smoke matrix.
+- Write release notes covering parallel tool-call handling, Gemma support, SGLang shorthand, structured logging, exception propagation, and image helper scope.
 
-Acceptance gate:
+## 8. Test Strategy
 
-- README examples match the actual constructor and method signatures.
-- A user can understand when to choose this handler versus the Responses-based sibling.
+### 8.1 Deterministic Suite
 
-## 7. Test Strategy
-
-The deterministic test suite should remain the primary release gate. Tests should not require network access, API keys, real model calls, or interactive scripts.
+This is the maintainer-local release gate while `tests/` remains ignored. It must not require network access, API keys, real model calls, or interactive scripts.
 
 Required coverage:
 
 - Constructor and OpenAI client setup.
 - `httpx.Client` timeout and pool configuration.
-- `close()` and context manager cleanup.
-- Payload construction and omission of unset values.
+- `close()` and context-manager cleanup.
+- Payload construction and `_omit_none()` stripping.
+- `instructions_role` behavior for `system`, `developer`, and `user`.
+- `_assemble_extra_body` shorthand assembly.
 - `max_completion_tokens` precedence over `max_tokens`.
-- Tool filtering with `enabled_tools`.
-- Non-streaming response handling.
-- Streaming response handling.
-- Tool-call execution and continuation.
-- Recursion depth cap.
-- Message trimming integrity.
-- Image content-array construction.
-- Rejection of unsupported image schemes.
-- Structured output passthrough.
+- `enabled_tools` filtering.
+- `extra_body` and `response_format` passthrough.
+- Non-streaming response handling for `stop`, `tool_calls`, `length`, `content_filter`, and unknown finish reasons.
+- Streaming response handling for text accumulation, tool-call stitching, reasoning deltas, and usage-only chunks.
+- `handle_function_calls()` single and parallel tool-call shapes.
+- Recursion depth through `ToolCallDepthExceeded`.
+- Message trimming integrity, including the orphan-tool guard.
+- Empty-response retry caps.
 - Secret redaction in errors and logs.
+- SDK exception propagation from both `invoke_model()` and `ask_model()`.
+- Image helper URL validation and content-array shape.
+- Structured log emission shape.
 
-Manual smoke tests are secondary and should be used only after deterministic tests pass:
+### 8.2 Interactive Smoke Scripts
+
+The local working directory currently contains:
+
+- [test_chatbot.py](openai_completions_agent_handler/tests/test_chatbot.py): interactive REPL for streaming and non-streaming chat.
+- [test_tool_call.py](openai_completions_agent_handler/tests/test_tool_call.py): single-turn tool-call exercise with a local Python function dispatcher.
+
+Note: these scripts are present locally today and intentionally remain untracked while `tests/` is ignored.
+
+### 8.3 Manual Smoke Matrix
+
+Run only after the deterministic suite passes:
 
 - OpenAI text completion.
 - OpenAI function call.
 - OpenAI streaming function call.
-- SGLang through `base_url`.
+- SGLang + Qwen3 through `base_url` with `--tool-call-parser qwen --reasoning-parser qwen3`.
+- SGLang + Gemma through `base_url` with `instructions_role=user` for chat-only validation.
 - vLLM through `base_url`.
 - LiteLLM proxy through `base_url`.
-- Image-capable model with `data:` and `https:` image URLs.
+- Parallel tool calls: verify the on-wire payload has one assistant message with multiple `tool_calls`.
 
-## 8. Known Risks and Mitigations
+## 9. Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Tool-call message history becomes invalid | Provider rejects continuation | Exact message-shape tests |
-| Streaming tool deltas are stitched incorrectly | Broken function names or malformed JSON | Chunk-level stream tests by index |
-| Usage-only stream chunk is dereferenced as a choice | Crash at end of stream | Explicit `choices == []` branch |
+| README references ignored local tests | Fresh clones cannot run documented validation | Mark test commands as maintainer-local or document the separate test-bundle source |
+| Streaming tool deltas stitched incorrectly | Broken function names or malformed JSON | Chunk-level stream tests by `index` |
+| Usage-only stream chunks dereferenced as choices | Crash at stream end | Explicit `choices == []` tests |
 | Empty model output retries forever | Hang or runaway spend | Hard retry cap |
-| `_ask_model_depth` leaks after exception | Broken recursion behavior | `finally` decrement and tests |
+| `_ask_model_depth` leaks after exceptions | Later calls fail unexpectedly | `finally` decrement and depth tests |
 | API key appears in logs or exceptions | Secret disclosure | Redaction helper and log tests |
+| SDK exceptions wrapped generically | Callers cannot handle retryable failures | Preserve original exception types |
+| Parallel tool calls emitted as separate assistants | Stricter providers reject continuation | Batched assistant message tests |
+| Gemma rejects system role | Provider 400 from chat template | `instructions_role="user"` tests and docs |
+| SGLang parser not configured | Tool calls arrive as raw text | Document required `--tool-call-parser` |
 | Provider parameter support drifts | Provider-specific failures | Omit unset values and isolate `extra_body` |
-| README examples drift from code | User integration failures | Example validation during release |
-| Dependencies are missing in clean environments | Tests fail before exercising code | Documented install/test workflow |
+| README examples drift from code | User integration failures | Validate examples during release |
+| Transitive dependencies unavailable | Install fails in clean environments | Document local/Git/PyPI dependency source |
+| Broad package discovery includes unwanted files | Dirty release artifacts | Narrow setuptools discovery |
 
-## 9. Release Checklist
+## 10. Release Checklist
 
 Before tagging v1:
 
-- All deterministic tests pass locally.
-- README encoding artifacts are fixed.
-- `docs/development-plan.md` reflects actual project status.
-- No `__pycache__` files are included in release artifacts.
-- Configuration schema matches implemented configuration behavior.
-- README examples use valid constructor arguments and message shapes.
-- Manual smoke tests pass for at least one OpenAI model and one OpenAI-compatible local/proxy provider.
+- README distinguishes package-user setup from maintainer-local validation with the ignored test bundle.
+- Deterministic tests pass in the maintainer-local checkout.
+- SDK exception types propagate unchanged from both `invoke_model()` and `ask_model()`.
+- The package installs from a clean checkout using the documented dependency flow.
+- No `__pycache__`, test cache, egg metadata, or build artifacts are included in release artifacts.
+- `configuration_schema.json` matches implemented behavior.
+- README examples match actual constructor arguments and message shapes.
+- Manual smoke matrix passes for OpenAI, SGLang+Qwen3, and one of vLLM/LiteLLM.
+- Both streaming and non-streaming tool-call paths are exercised end to end.
+- Parallel tool-call payloads are inspected and confirm one batched assistant message.
+- Error logs are inspected for API-key redaction.
 
-## 10. Suggested Next Work Items
+## 11. Recommended Next Work Items
 
-Recommended order from the current repository state:
+In suggested execution order:
 
-1. Fix packaging/dev dependency setup so tests run cleanly in a fresh environment.
-2. Clean README encoding artifacts and align examples with the actual package.
-3. Expand exact-payload tests for `invoke_model()` and `_build_request_payload()`.
-4. Harden exception propagation so SDK exception types are not unnecessarily hidden.
-5. Strengthen message trimming tests for multi-tool-call groups.
-6. Add streaming JSON final-parse behavior or document that the current queue helpers own partial JSON processing.
-7. Run manual smoke tests against OpenAI and at least one `base_url` provider.
+1. Update README Quick Start so ignored local tests are presented as maintainer-local validation, not a fresh-clone guarantee.
+2. Fill the remaining test gaps: multi-chunk streaming tool-call stitching, final usage-only stream chunk, end-to-end recursion-depth lifecycle, and API-key redaction on wrapped exceptions.
+3. Update README dependency instructions so they match `pyproject.toml` and the actual local-provider runtime dependencies.
+4. Narrow setuptools package discovery.
+5. Decide whether `tool_call_role` belongs in a top-level agent schema/docs section or should be made optional in code.
+6. Run the manual smoke matrix against OpenAI and at least one local provider.
+7. Tag v1.

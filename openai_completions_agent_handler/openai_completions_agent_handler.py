@@ -275,6 +275,30 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             return merged
         return [{"role": "user", "content": instructions}] + merged
 
+    @staticmethod
+    def _validate_image_url(url: str) -> None:
+        """Raise ValueError if the image URL scheme is unsupported."""
+        allowed = {"http", "https", "data"}
+        scheme = url.split(":", 1)[0].lower()
+        if scheme not in allowed:
+            raise ValueError(
+                f"Unsupported image URL scheme '{scheme}'. "
+                f"Allowed schemes: {', '.join(sorted(allowed))}."
+            )
+
+    @staticmethod
+    def _build_image_message(
+        image_url: str, text: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Build a Chat Completions content array containing an image."""
+        OpenAICompletionsEventHandler._validate_image_url(image_url)
+        content: List[Dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": image_url}}
+        ]
+        if text:
+            content.insert(0, {"type": "text", "text": text})
+        return {"role": "user", "content": content}
+
     def invoke_model(self, **kwargs: Dict[str, Any]) -> Any:
         try:
             if self.enable_timeline_log:
@@ -328,11 +352,56 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     f"stream={bool(kwargs.get('stream'))})"
                 )
             raise
+        except openai.APIError as e:
+            safe_msg = self._redact_api_key(str(e))
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(f"OpenAI APIError: {safe_msg}")
+            raise
         except Exception as e:
             safe_msg = self._redact_api_key(str(e))
             if self.logger and self.logger.isEnabledFor(logging.ERROR):
                 self.logger.error(f"Error invoking model: {safe_msg}")
             raise Exception(f"Failed to invoke model: {safe_msg}")
+
+    def _attach_images(
+        self,
+        input_messages: List[Dict[str, Any]],
+        image_urls: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Attach image_url content parts to the last user message.
+
+        If `input_messages` has no trailing user message, the first image gets
+        its own user message via `_build_image_message`; remaining images are
+        appended to it. The caller's list is not mutated.
+        """
+        if not image_urls:
+            return input_messages
+
+        input_messages = list(input_messages)
+
+        if not input_messages or input_messages[-1].get("role") != "user":
+            input_messages.append(self._build_image_message(image_urls[0]))
+            image_urls = image_urls[1:]
+
+        if not image_urls:
+            return input_messages
+
+        last = input_messages[-1]
+        existing = last.get("content")
+        if isinstance(existing, str):
+            content = [{"type": "text", "text": existing}] if existing else []
+        elif isinstance(existing, list):
+            content = list(existing)
+        else:
+            content = []
+
+        for url in image_urls:
+            self._validate_image_url(url)
+            content.append({"type": "image_url", "image_url": {"url": url}})
+
+        input_messages[-1] = {**last, "content": content}
+        return input_messages
 
     @performance_monitor.monitor_operation(operation_name="OpenAICompletions")
     def ask_model(
@@ -340,6 +409,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         input_messages: List[Dict[str, Any]],
         queue: Queue = None,
         stream_event: threading.Event = None,
+        input_images: Optional[List[str]] = None,
         model_setting: Dict[str, Any] = None,
     ) -> Optional[str]:
         if self.enable_timeline_log:
@@ -383,6 +453,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 self.model_setting.update(model_setting)
                 self._tools_cache_valid = False
 
+            if input_images:
+                input_messages = self._attach_images(input_messages, input_images)
+
             if (
                 self.enable_timeline_log
                 and self.logger
@@ -416,7 +489,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 run_id = self.handle_response(response, input_messages)
 
             return run_id
-        except ToolCallDepthExceeded:
+        except (ToolCallDepthExceeded, openai.APIError):
             raise
         except Exception as e:
             safe_msg = self._redact_api_key(str(e))
