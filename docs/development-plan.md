@@ -130,7 +130,7 @@ Important optional fields:
 - `stop`, `seed`, `logit_bias`
 - `instructions_role`: `"system"` (default), `"developer"`, or `"user"`
 - `enabled_tools`
-- `extra_body`
+- `extra_body`, `extra_headers`, `extra_query`
 - `enable_thinking`, `separate_reasoning`
 - `request_timeout_seconds`, `connect_timeout_seconds`
 - `max_retries`

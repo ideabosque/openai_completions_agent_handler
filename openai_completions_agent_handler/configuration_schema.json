@@ -115,7 +115,17 @@
         },
         "extra_body": {
             "type": "object",
-            "description": "Passthrough object for provider-specific extensions (e.g., SGLang chat_template_kwargs, separate_reasoning).",
+            "description": "Passthrough object for provider-specific body fields (e.g., SGLang chat_template_kwargs, separate_reasoning).",
+            "additionalProperties": true
+        },
+        "extra_headers": {
+            "type": "object",
+            "description": "Passthrough object for additional HTTP request headers (e.g., proxy auth, request tracing, custom routing headers). Forwarded verbatim to chat.completions.create().",
+            "additionalProperties": {"type": "string"}
+        },
+        "extra_query": {
+            "type": "object",
+            "description": "Passthrough object for additional URL query string parameters. Forwarded verbatim to chat.completions.create().",
             "additionalProperties": true
         },
         "enable_thinking": {
