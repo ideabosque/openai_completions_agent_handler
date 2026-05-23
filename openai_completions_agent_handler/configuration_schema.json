@@ -115,7 +115,7 @@
         },
         "extra_body": {
             "type": "object",
-            "description": "Passthrough object for provider-specific body fields (e.g., SGLang chat_template_kwargs, separate_reasoning).",
+            "description": "Passthrough object for provider-specific body fields (e.g., SGLang chat_template_kwargs/separate_reasoning or Z.AI GLM thinking).",
             "additionalProperties": true
         },
         "extra_headers": {
@@ -135,6 +135,11 @@
         "separate_reasoning": {
             "type": "boolean",
             "description": "SGLang shorthand: when true, the handler adds separate_reasoning=true to extra_body so the server splits reasoning into the reasoning_content field. Overridden by any value the caller sets explicitly in extra_body."
+        },
+        "reasoning_effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Reasoning effort for Chat Completions endpoints that implement this parameter, including zai.glm-5 through Bedrock Mantle. Direct Z.AI GLM endpoints configure thinking through extra_body.thinking instead."
         },
         "instructions_role": {
             "type": "string",

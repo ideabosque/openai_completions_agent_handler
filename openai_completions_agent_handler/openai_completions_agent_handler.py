@@ -41,6 +41,70 @@ def _truncate(s: str, limit: int = 200) -> str:
     return s if len(s) <= limit else f"{s[:limit]}...({len(s)} chars)"
 
 
+class _ThinkTagSplitter:
+    """
+    Stream-aware splitter for inline <think>...</think> reasoning blocks.
+
+    Used when an upstream server returns reasoning bundled into `content`
+    rather than a dedicated field. Each call to feed(chunk) returns
+    (content, thinking) pieces ready to emit. Partial tag matches at the
+    buffer tail are held until enough characters arrive to split them.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self.in_think = False
+        self.buffer = ""
+
+    @staticmethod
+    def _partial_tag_suffix(text: str, tag: str) -> int:
+        max_length = min(len(text), len(tag) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(tag[:length]):
+                return length
+        return 0
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        self.buffer += chunk
+        content_parts: List[str] = []
+        think_parts: List[str] = []
+        while self.buffer:
+            if not self.in_think:
+                idx = self.buffer.find(self.OPEN)
+                if idx == -1:
+                    keep = self._partial_tag_suffix(self.buffer, self.OPEN)
+                    if len(self.buffer) > keep:
+                        content_parts.append(self.buffer[:-keep] if keep else self.buffer)
+                        self.buffer = self.buffer[-keep:] if keep else ""
+                    break
+                if idx > 0:
+                    content_parts.append(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(self.OPEN):]
+                self.in_think = True
+            else:
+                idx = self.buffer.find(self.CLOSE)
+                if idx == -1:
+                    keep = self._partial_tag_suffix(self.buffer, self.CLOSE)
+                    if len(self.buffer) > keep:
+                        think_parts.append(self.buffer[:-keep] if keep else self.buffer)
+                        self.buffer = self.buffer[-keep:] if keep else ""
+                    break
+                if idx > 0:
+                    think_parts.append(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(self.CLOSE):]
+                self.in_think = False
+        return "".join(content_parts), "".join(think_parts)
+
+    def flush(self) -> tuple[str, str]:
+        tail = self.buffer
+        self.buffer = ""
+        if self.in_think:
+            return "", tail
+        return tail, ""
+
+
 class OpenAICompletionsEventHandler(AIAgentEventHandler):
     """
     Manages conversations and function calls via OpenAI's Chat Completions API.
@@ -77,6 +141,16 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 http_client=self._http_client,
                 max_retries=sdk_max_retries,
             )
+
+            # Normalize tool shape BEFORE enabled_tools filtering, since
+            # mcp_http_client.export_tools_for_llm("gpt", ...) emits the
+            # Responses API flat shape {"type":"function","name":...,
+            # "parameters":...} while Chat Completions requires the nested
+            # shape {"type":"function","function":{"name":..., ...}}.
+            if "tools" in config and config["tools"]:
+                config["tools"] = self._normalize_tools_to_chat_completions(
+                    config["tools"]
+                )
 
             if "enabled_tools" in config:
                 enabled_set = set(config["enabled_tools"])
@@ -176,6 +250,21 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
     def _has_valid_content(self, text: Optional[str]) -> bool:
         return bool(text and text.strip())
 
+    @staticmethod
+    def _get_reasoning_content(part: Any) -> Optional[str]:
+        for field_name in ("reasoning_content", "reasoning", "thinking"):
+            value = getattr(part, field_name, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _split_inline_reasoning(content: str) -> tuple[str, str]:
+        splitter = _ThinkTagSplitter()
+        visible, reasoning = splitter.feed(content)
+        tail_visible, tail_reasoning = splitter.flush()
+        return visible + tail_visible, reasoning + tail_reasoning
+
     def _get_elapsed_time(self) -> float:
         if not hasattr(self, "_global_start_time") or self._global_start_time is None:
             return 0.0
@@ -220,12 +309,16 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
     def _assemble_extra_body(self, config: Dict[str, Any]) -> None:
         """
-        Convert SGLang/Qwen3 shorthand config keys into the nested `extra_body`
-        structure that chat.completions.create() expects.
+        Convert SGLang/Qwen3 shorthand config keys into the nested
+        `extra_body` structure that chat.completions.create() expects.
 
         Recognized shorthand keys (top-level in `configuration`):
             enable_thinking    -> extra_body["chat_template_kwargs"]["enable_thinking"]
             separate_reasoning -> extra_body["separate_reasoning"]
+
+        Z.AI GLM expects `extra_body={"thinking": {"type": "enabled"}}`.
+        Supply that explicitly rather than combining two providers' extension
+        keys in the same request.
 
         Anything the caller has already placed in `extra_body` wins; this method
         only fills missing slots so users can always override by setting
@@ -254,6 +347,44 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             else:
                 merged[k] = v
         config["extra_body"] = merged
+
+    @staticmethod
+    def _normalize_tools_to_chat_completions(
+        tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalize tool definitions to the Chat Completions nested shape.
+
+        Accepted input shapes (preserved or converted to the same output):
+            Responses API flat:
+                {"type":"function","name":"x","description":"...","parameters":{...}}
+            Chat Completions nested:
+                {"type":"function","function":{"name":"x","description":"...","parameters":{...}}}
+
+        Anything that doesn't match either pattern is passed through unchanged.
+        """
+        normalized: List[Dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                normalized.append(tool)
+                continue
+            if isinstance(tool.get("function"), dict):
+                normalized.append(tool)
+                continue
+            if tool.get("type") == "function" and "name" in tool:
+                normalized.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("parameters", {}),
+                        },
+                    }
+                )
+                continue
+            normalized.append(tool)
+        return normalized
 
     def _merge_instructions_into_first_user(
         self, messages: List[Dict[str, Any]], instructions: str
@@ -537,6 +668,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         self,
         tool_calls: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
+        reasoning_content: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Execute a batch of tool_calls that came back from a single model turn.
@@ -564,7 +696,15 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 }
             )
 
-        self._append_assistant_with_tool_calls(validated, input_messages)
+        if self.logger and self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"[handle_function_calls] Processing {len(validated)} tool call(s): "
+                f"{[fcd['name'] for fcd in validated]}"
+            )
+
+        self._append_assistant_with_tool_calls(
+            validated, input_messages, reasoning_content=reasoning_content
+        )
 
         for fcd in validated:
             self._execute_and_append_result(fcd, input_messages)
@@ -576,14 +716,30 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         function_call_data: Dict[str, Any],
         input_messages: List[Dict[str, Any]],
     ) -> None:
+        name = function_call_data["name"]
         if self.enable_timeline_log:
             call_start = pendulum.now("UTC")
 
         try:
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[handle_function_call] Processing arguments for function {name}"
+                )
             arguments = self._process_function_arguments(function_call_data)
+
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[handle_function_call] Executing function {name} with arguments "
+                    f"{_truncate(Serializer.json_dumps(arguments))}"
+                )
             function_output, serialized_output = self._execute_function(
                 function_call_data, arguments
             )
+
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[handle_function_call][{name}] Updating conversation history"
+                )
             self._append_tool_result(
                 function_call_data["id"], serialized_output, input_messages
             )
@@ -748,25 +904,27 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         self,
         function_call_data_list: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
+        reasoning_content: Optional[str] = None,
     ) -> None:
         """Append ONE assistant message containing every tool_call from this turn."""
-        input_messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": fcd["id"],
-                        "type": "function",
-                        "function": {
-                            "name": fcd["name"],
-                            "arguments": fcd.get("arguments", "{}"),
-                        },
-                    }
-                    for fcd in function_call_data_list
-                ],
-            }
-        )
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": fcd["id"],
+                    "type": "function",
+                    "function": {
+                        "name": fcd["name"],
+                        "arguments": fcd.get("arguments", "{}"),
+                    },
+                }
+                for fcd in function_call_data_list
+            ],
+        }
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+        input_messages.append(message)
 
     def _append_tool_result(
         self,
@@ -794,7 +952,10 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         message = response.choices[0].message
         content = message.content or ""
         tool_calls = message.tool_calls
-        reasoning_content = getattr(message, "reasoning_content", None)
+        reasoning_content = self._get_reasoning_content(message)
+        content, inline_reasoning = self._split_inline_reasoning(content)
+        if inline_reasoning:
+            reasoning_content = (reasoning_content or "") + inline_reasoning
         finish_reason = response.choices[0].finish_reason
 
         self._last_usage = response.usage
@@ -829,6 +990,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     for tc in tool_calls
                 ],
                 input_messages,
+                reasoning_content=reasoning_content,
             )
             input_messages = self._trim_messages_for_recursion(input_messages)
             self.ask_model(input_messages)
@@ -839,7 +1001,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         if finish_reason == "content_filter":
             self.final_output["filtered"] = True
 
-        if not self._has_valid_content(content):
+        if not self._has_valid_content(content) and not reasoning_content:
             if self.logger and self.logger.isEnabledFor(logging.WARNING):
                 self.logger.warning(
                     f"Empty response, retrying (attempt {retry_count + 1}/2)..."
@@ -879,9 +1041,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         accumulated_partial_text_parts = []
         accumulated_partial_json_parts = []
         accumulated_reasoning_parts = []
+        accumulated_partial_reasoning_parts = []
         received_any_content = False
         output_format = self.output_format_type
         index = 0
+        reasoning_index = 0
         tool_call_count = 0
         finish_reason = None
 
@@ -889,6 +1053,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
         if self.enable_timeline_log:
             stream_start_time = pendulum.now("UTC")
+
+        first_delta_logged = False
+        # Fallback for compatible servers that emit inline <think> tags
+        # instead of the provider's dedicated reasoning_content field.
+        think_splitter = _ThinkTagSplitter()
 
         for chunk in response_stream:
             if run_id is None:
@@ -905,36 +1074,89 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             delta = choice.delta
             finish_reason = choice.finish_reason
 
+            # One-time diagnostic: log the keys present in the first delta so a
+            # provider returning reasoning in a non-standard field is visible.
+            if (
+                not first_delta_logged
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                first_delta_logged = True
+                try:
+                    delta_dump = delta.model_dump(exclude_none=True)
+                    self.logger.info(
+                        f"[STREAM_DELTA_KEYS] first delta keys={list(delta_dump.keys())} "
+                        f"sample={_truncate(str(delta_dump))}"
+                    )
+                except Exception:
+                    self.logger.info(
+                        f"[STREAM_DELTA_KEYS] first delta attrs="
+                        f"{[a for a in dir(delta) if not a.startswith('_')]}"
+                    )
+
             if getattr(delta, "content", None):
                 received_any_content = True
-                print(delta.content, end="", flush=True)
-                accumulated_text_parts.append(delta.content)
+                # Split any inline <think>...</think> blocks out of content
+                # before printing/accumulating. If no tags are present this is
+                # effectively a passthrough.
+                content_part, think_part = think_splitter.feed(delta.content)
+                if think_part:
+                    print(think_part, end="", flush=True)
+                    accumulated_reasoning_parts.append(think_part)
+                    accumulated_partial_reasoning_parts.append(think_part)
+                    reasoning_index, remaining_reasoning = self.process_text_content(
+                        reasoning_index,
+                        "".join(accumulated_partial_reasoning_parts),
+                        "text",
+                        suffix="reasoning",
+                    )
+                    accumulated_partial_reasoning_parts = (
+                        [remaining_reasoning] if remaining_reasoning else []
+                    )
+                if content_part:
+                    print(content_part, end="", flush=True)
+                    accumulated_text_parts.append(content_part)
 
-                if output_format in ["json_object", "json_schema"]:
-                    accumulated_partial_json_parts.append(delta.content)
-                    temp_text = "".join(accumulated_text_parts)
-                    index, temp_text, remaining_json = self.process_and_send_json(
-                        index,
-                        temp_text,
-                        "".join(accumulated_partial_json_parts),
-                        output_format,
-                    )
-                    accumulated_partial_json_parts = (
-                        [remaining_json] if remaining_json else []
-                    )
-                else:
-                    accumulated_partial_text_parts.append(delta.content)
-                    index, remaining_text = self.process_text_content(
-                        index, "".join(accumulated_partial_text_parts), output_format
-                    )
-                    accumulated_partial_text_parts = (
-                        [remaining_text] if remaining_text else []
-                    )
+                    if output_format in ["json_object", "json_schema"]:
+                        accumulated_partial_json_parts.append(content_part)
+                        temp_text = "".join(accumulated_text_parts)
+                        index, temp_text, remaining_json = self.process_and_send_json(
+                            index,
+                            temp_text,
+                            "".join(accumulated_partial_json_parts),
+                            output_format,
+                        )
+                        accumulated_partial_json_parts = (
+                            [remaining_json] if remaining_json else []
+                        )
+                    else:
+                        accumulated_partial_text_parts.append(content_part)
+                        index, remaining_text = self.process_text_content(
+                            index, "".join(accumulated_partial_text_parts), output_format
+                        )
+                        accumulated_partial_text_parts = (
+                            [remaining_text] if remaining_text else []
+                        )
 
-            reasoning_content = getattr(delta, "reasoning_content", None)
-            if reasoning_content and isinstance(reasoning_content, str):
+            # Providers use different field names for streamed reasoning chunks:
+            #   SGLang / Qwen3 / OpenAI o-series / GLM via SGLang -> reasoning_content
+            #   Anthropic Claude on some Bedrock paths             -> thinking
+            #   Some misc proxies                                  -> reasoning
+            reasoning_content = self._get_reasoning_content(delta)
+            if reasoning_content:
+                received_any_content = True
                 print(reasoning_content, end="", flush=True)
                 accumulated_reasoning_parts.append(reasoning_content)
+                accumulated_partial_reasoning_parts.append(reasoning_content)
+                reasoning_index, remaining_reasoning = self.process_text_content(
+                    reasoning_index,
+                    "".join(accumulated_partial_reasoning_parts),
+                    "text",
+                    suffix="reasoning",
+                )
+                accumulated_partial_reasoning_parts = (
+                    [remaining_reasoning] if remaining_reasoning else []
+                )
 
             if getattr(delta, "tool_calls", None):
                 received_any_content = True
@@ -968,7 +1190,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         for acc in tool_call_accumulators.values()
                     ]
                     input_messages = self.handle_function_calls(
-                        tool_calls, input_messages
+                        tool_calls,
+                        input_messages,
+                        reasoning_content="".join(accumulated_reasoning_parts) or None,
                     )
                     input_messages = self._trim_messages_for_recursion(input_messages)
                     self.ask_model(
@@ -1004,6 +1228,34 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                             f"Unknown finish_reason: {finish_reason}, treating as stop"
                         )
                     role = getattr(delta, "role", None) or "assistant"
+
+        # Drain anything still buffered in the think-tag splitter (e.g. a
+        # final segment that arrived without ever crossing a tag boundary).
+        tail_content, tail_think = think_splitter.flush()
+        if tail_think:
+            print(tail_think, end="", flush=True)
+            accumulated_reasoning_parts.append(tail_think)
+            accumulated_partial_reasoning_parts.append(tail_think)
+            reasoning_index, remaining_reasoning = self.process_text_content(
+                reasoning_index,
+                "".join(accumulated_partial_reasoning_parts),
+                "text",
+                suffix="reasoning",
+            )
+            accumulated_partial_reasoning_parts = (
+                [remaining_reasoning] if remaining_reasoning else []
+            )
+        if tail_content:
+            print(tail_content, end="", flush=True)
+            accumulated_text_parts.append(tail_content)
+
+        if accumulated_partial_reasoning_parts:
+            self.send_data_to_stream(
+                index=reasoning_index,
+                data_format="text",
+                chunk_delta="".join(accumulated_partial_reasoning_parts),
+                suffix="reasoning",
+            )
 
         final_accumulated_text = "".join(accumulated_text_parts)
 

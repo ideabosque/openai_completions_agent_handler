@@ -168,6 +168,28 @@ Notes on the configuration:
 
 Use `"openai_api_key": "EMPTY"` for SGLang/vLLM servers that do not require authentication. The full list of supported configuration fields is in [`configuration_schema.json`](openai_completions_agent_handler/configuration_schema.json).
 
+### Bedrock GLM Reasoning
+
+Amazon Bedrock exposes supported GLM models through its OpenAI-compatible Chat Completions endpoint. For `zai.glm-5` on the Bedrock Mantle endpoint, use `reasoning_effort` to request returned reasoning:
+
+```json
+{
+  "endpoint_id": "bedrock-glm",
+  "agent_name": "GLM Assistant",
+  "configuration": {
+    "model": "zai.glm-5",
+    "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+    "openai_api_key": "${BEDROCK_API_KEY}",
+    "max_tokens": 4096,
+    "reasoning_effort": "high"
+  }
+}
+```
+
+The handler places returned reasoning in `final_output["reasoning_summary"]` and preserves `reasoning_content` on assistant tool-call messages before submitting tool results.
+
+For direct Z.AI GLM endpoints, Z.AI documents `extra_body: {"thinking": {"type": "enabled", "clear_thinking": false}}` instead. Keep these provider-specific request forms separate; passing the Z.AI `thinking` body to the Bedrock Mantle endpoint did not return reasoning in the local tool-call smoke test.
+
 ---
 
 ## Usage

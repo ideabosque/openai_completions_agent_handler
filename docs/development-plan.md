@@ -131,7 +131,10 @@ Important optional fields:
 - `instructions_role`: `"system"` (default), `"developer"`, or `"user"`
 - `enabled_tools`
 - `extra_body`, `extra_headers`, `extra_query`
-- `enable_thinking`, `separate_reasoning`
+- `enable_thinking` (SGLang/Qwen3 shorthand for `extra_body.chat_template_kwargs.enable_thinking`)
+- `separate_reasoning` (SGLang only)
+- `reasoning_effort` (including `zai.glm-5` through Bedrock Mantle Chat Completions)
+- For direct Z.AI GLM endpoints, pass `extra_body: {"thinking": {"type": "enabled"}}`; returned reasoning is read from `reasoning_content`.
 - `request_timeout_seconds`, `connect_timeout_seconds`
 - `max_retries`
 - `pool_max_connections`, `pool_max_keepalive_connections`
