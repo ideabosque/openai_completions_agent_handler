@@ -14,6 +14,30 @@ OpenAI currently recommends the Responses API for new OpenAI-native agent applic
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Install SilvaEngine dependencies.
+#    If your environment does not resolve these from PyPI, install the
+#    corresponding local sibling repos instead.
+pip install -e /path/to/ai_agent_handler
+pip install -e /path/to/silvaengine_utility
+
+# 2. Install this package
+pip install -e .
+```
+
+Maintainer-local validation:
+
+```bash
+# The tests directory is intentionally ignored for now and is not part of
+# tracked release contents. Run this only in a checkout that has the local
+# test bundle present.
+python -m unittest openai_completions_agent_handler.tests.test_deterministic -v
+```
+
+---
+
 ## Inheritance
 
 ```
@@ -33,7 +57,7 @@ AIAgentEventHandler
 | `client` | OpenAI SDK client; honors `base_url` for custom servers. |
 | `model_setting` | Dict built from `agent["configuration"]`; passed to `chat.completions.create()` after `omit_none()` filtering. |
 | `_http_client` | Pooled `httpx.Client` with configured timeouts and connection limits. |
-| `instructions_role` | `"system"` (default) or `"developer"`. Configured explicitly; never inferred from model name. |
+| `instructions_role` | `"system"` (default), `"developer"`, or `"user"`. Configured explicitly; never inferred from model name. |
 | `final_output` | Populated with `message_id`, `role`, `content`, and optional `reasoning_summary`, `truncated`, `filtered` flags. |
 
 ### Core methods
@@ -46,12 +70,7 @@ def __init__(
     **setting: Dict[str, Any],
 ) -> None: ...
 
-def invoke_model(
-    self,
-    messages: List[Dict[str, Any]],
-    stream: bool = False,
-    **kwargs,
-) -> Any: ...
+def invoke_model(self, **kwargs: Dict[str, Any]) -> Any: ...
 
 def ask_model(
     self,
@@ -64,7 +83,7 @@ def ask_model(
 def close(self) -> None: ...
 ```
 
-`invoke_model` reads all OpenAI parameters from `self.model_setting`; pass overrides through `**kwargs` only when you need a one-off change. The handler also supports the context-manager protocol so the pooled HTTP client is released cleanly.
+`invoke_model` takes everything via `**kwargs` — `messages`, `stream`, and any per-call overrides for fields normally read from `self.model_setting`. The handler also supports the context-manager protocol so the pooled HTTP client is released cleanly.
 
 ---
 
@@ -121,7 +140,7 @@ def close(self) -> None: ...
 
 Notes on the configuration:
 
-- `instructions_role` is in `configuration` and controls the role of the leading instruction message. Default is `system`; set `developer` only when the target OpenAI model expects it.
+- `instructions_role` is in `configuration` and controls where agent instructions are placed. Default is `system`; set `developer` only when the target OpenAI model expects it, and set `user` for chat templates such as Gemma that reject system messages.
 - `tool_call_role` lives at the top level of the agent dict (not under `configuration`). It is the role used when the handler appends tool-call records to `_short_term_memory` for clients that read it back.
 - If both `max_tokens` and `max_completion_tokens` are set, the handler keeps `max_completion_tokens` and warns once.
 - `enabled_tools` (array of names) filters the `tools` list at construction time. Tools not in the set are dropped.
@@ -148,6 +167,28 @@ Notes on the configuration:
 ```
 
 Use `"openai_api_key": "EMPTY"` for SGLang/vLLM servers that do not require authentication. The full list of supported configuration fields is in [`configuration_schema.json`](openai_completions_agent_handler/configuration_schema.json).
+
+### Bedrock GLM Reasoning
+
+Amazon Bedrock exposes supported GLM models through its OpenAI-compatible Chat Completions endpoint. For `zai.glm-5` on the Bedrock Mantle endpoint, use `reasoning_effort` to request returned reasoning:
+
+```json
+{
+  "endpoint_id": "bedrock-glm",
+  "agent_name": "GLM Assistant",
+  "configuration": {
+    "model": "zai.glm-5",
+    "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+    "openai_api_key": "${BEDROCK_API_KEY}",
+    "max_tokens": 4096,
+    "reasoning_effort": "high"
+  }
+}
+```
+
+The handler places returned reasoning in `final_output["reasoning_summary"]` and preserves `reasoning_content` on assistant tool-call messages before submitting tool results.
+
+For direct Z.AI GLM endpoints, Z.AI documents `extra_body: {"thinking": {"type": "enabled", "clear_thinking": false}}` instead. Keep these provider-specific request forms separate; passing the Z.AI `thinking` body to the Bedrock Mantle endpoint did not return reasoning in the local tool-call smoke test.
 
 ---
 
@@ -229,6 +270,22 @@ with OpenAICompletionsEventHandler(logger=None, agent=weather_agent) as handler:
             "created_at": pendulum.now("UTC"),
         })
 ```
+
+### Image Input
+
+`ask_model` accepts an `input_images` parameter — a list of `http`, `https`, or `data` URLs that get attached as `image_url` content parts to the last user message. If no trailing user message exists, the handler synthesizes one.
+
+```python
+handler.ask_model(
+    [{"role": "user", "content": "Describe these pictures."}],
+    input_images=[
+        "https://example.com/cat.png",
+        "data:image/png;base64,iVBORw0KGgo=...",
+    ],
+)
+```
+
+URL schemes other than `http`, `https`, and `data` raise `ValueError`. The handler does not fetch URLs itself — the model provider does, so `https:` URLs expand the provider's outbound surface.
 
 ---
 
