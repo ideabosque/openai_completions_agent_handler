@@ -178,6 +178,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "instructions_role",
                     "enable_thinking",
                     "separate_reasoning",
+                    "enable_think_tag_split",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -231,6 +232,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
             self.instructions_role = str(config.get("instructions_role", "system"))
             self._max_tool_call_depth = int(config.get("max_tool_call_depth", 8))
+            self._enable_think_tag_split = bool(
+                config.get("enable_think_tag_split", False)
+            )
             self.output_format_type = self.model_setting.get("response_format", {}).get(
                 "type", "text"
             )
@@ -1072,9 +1076,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             stream_start_time = pendulum.now("UTC")
 
         first_delta_logged = False
-        # Fallback for compatible servers that emit inline <think> tags
-        # instead of the provider's dedicated reasoning_content field.
-        think_splitter = _ThinkTagSplitter()
+        # Optional fallback for compatible servers that emit inline <think>
+        # tags instead of the provider's dedicated reasoning_content field.
+        # Off by default; enable via configuration.enable_think_tag_split.
+        think_splitter = (
+            _ThinkTagSplitter() if self._enable_think_tag_split else None
+        )
 
         # WebSocket lifecycle state matching openai_agent_handler's pattern.
         content_message_started = False
@@ -1118,10 +1125,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
             if getattr(delta, "content", None):
                 received_any_content = True
-                # Split any inline <think>...</think> blocks out of content
-                # before printing/accumulating. If no tags are present this is
-                # effectively a passthrough.
-                content_part, think_part = think_splitter.feed(delta.content)
+                # Optionally split any inline <think>...</think> blocks out
+                # of content (opt-in via configuration.enable_think_tag_split).
+                # Pass-through when disabled.
+                if think_splitter is not None:
+                    content_part, think_part = think_splitter.feed(delta.content)
+                else:
+                    content_part, think_part = delta.content, ""
                 if think_part:
                     reasoning_active = True
                     print(think_part, end="", flush=True)
@@ -1316,7 +1326,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
         # Drain anything still buffered in the think-tag splitter (e.g. a
         # final segment that arrived without ever crossing a tag boundary).
-        tail_content, tail_think = think_splitter.flush()
+        # No-op when the splitter is disabled.
+        if think_splitter is not None:
+            tail_content, tail_think = think_splitter.flush()
+        else:
+            tail_content, tail_think = "", ""
         if tail_think:
             reasoning_active = True
             print(tail_think, end="", flush=True)

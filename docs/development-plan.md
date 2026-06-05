@@ -134,6 +134,7 @@ Important optional fields:
 - `enable_thinking` (SGLang/Qwen3 shorthand for `extra_body.chat_template_kwargs.enable_thinking`)
 - `separate_reasoning` (SGLang only)
 - `reasoning_effort` (including `zai.glm-5` through Bedrock Mantle Chat Completions)
+- `enable_think_tag_split` — opt-in fallback (default `false`). When true, the streaming handler scans `delta.content` for inline `<think>...</think>` blocks and routes them to the reasoning channel. Enable only for servers that emit raw `<think>` tags in content instead of populating `delta.reasoning_content` (e.g. vLLM + GLM-5 hitting parser bug [#29763](https://github.com/vllm-project/vllm/issues/29763)).
 - For direct Z.AI GLM endpoints, pass `extra_body: {"thinking": {"type": "enabled"}}`; returned reasoning is read from `reasoning_content`.
 - `request_timeout_seconds`, `connect_timeout_seconds`
 - `max_retries`
