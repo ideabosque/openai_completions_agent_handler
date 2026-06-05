@@ -141,6 +141,11 @@
             "enum": ["low", "medium", "high"],
             "description": "Reasoning effort for Chat Completions endpoints that implement this parameter, including zai.glm-5 through Bedrock Mantle. Direct Z.AI GLM endpoints configure thinking through extra_body.thinking instead."
         },
+        "enable_think_tag_split": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the streaming handler scans content for inline <think>...</think> blocks and routes them to the reasoning channel. Enable only for servers that fail to populate delta.reasoning_content and emit raw <think> tags instead (e.g. vLLM with GLM-5 hitting parser bug #29763, DeepSeek/Qwen3 without a reasoning parser flag). Off by default."
+        },
         "instructions_role": {
             "type": "string",
             "enum": ["system", "developer", "user"],
