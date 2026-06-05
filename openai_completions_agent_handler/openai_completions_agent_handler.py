@@ -1076,6 +1076,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         # instead of the provider's dedicated reasoning_content field.
         think_splitter = _ThinkTagSplitter()
 
+        # WebSocket lifecycle state matching openai_agent_handler's pattern.
+        content_message_started = False
+        reasoning_active = False
+        reasoning_no = 0
+
         for chunk in response_stream:
             if run_id is None:
                 run_id = chunk.id
@@ -1118,6 +1123,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 # effectively a passthrough.
                 content_part, think_part = think_splitter.feed(delta.content)
                 if think_part:
+                    reasoning_active = True
                     print(think_part, end="", flush=True)
                     accumulated_reasoning_parts.append(think_part)
                     accumulated_partial_reasoning_parts.append(think_part)
@@ -1125,12 +1131,41 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         reasoning_index,
                         "".join(accumulated_partial_reasoning_parts),
                         "text",
-                        suffix="reasoning",
+                        suffix=f"rs#{reasoning_no}",
                     )
                     accumulated_partial_reasoning_parts = (
                         [remaining_reasoning] if remaining_reasoning else []
                     )
                 if content_part:
+                    # Transition from reasoning to content: flush leftover
+                    # reasoning text and close the reasoning block before
+                    # opening the content message.
+                    if reasoning_active:
+                        if accumulated_partial_reasoning_parts:
+                            self.send_data_to_stream(
+                                index=reasoning_index,
+                                data_format="text",
+                                chunk_delta="".join(
+                                    accumulated_partial_reasoning_parts
+                                ),
+                                suffix=f"rs#{reasoning_no}",
+                            )
+                            accumulated_partial_reasoning_parts = []
+                            reasoning_index += 1
+                        reasoning_active = False
+                        reasoning_no += 1
+
+                    # Signal start of content message on the first content delta.
+                    if not content_message_started:
+                        content_message_started = True
+                        if index == 0 and reasoning_index > 0:
+                            index = reasoning_index + 1
+                        self.send_data_to_stream(
+                            index=index,
+                            data_format=output_format,
+                        )
+                        index += 1
+
                     print(content_part, end="", flush=True)
                     accumulated_text_parts.append(content_part)
 
@@ -1162,6 +1197,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             reasoning_content = self._get_reasoning_content(delta)
             if reasoning_content:
                 received_any_content = True
+                reasoning_active = True
                 print(reasoning_content, end="", flush=True)
                 accumulated_reasoning_parts.append(reasoning_content)
                 accumulated_partial_reasoning_parts.append(reasoning_content)
@@ -1169,7 +1205,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     reasoning_index,
                     "".join(accumulated_partial_reasoning_parts),
                     "text",
-                    suffix="reasoning",
+                    suffix=f"rs#{reasoning_no}",
                 )
                 accumulated_partial_reasoning_parts = (
                     [remaining_reasoning] if remaining_reasoning else []
@@ -1196,6 +1232,38 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 self._last_finish_reason = finish_reason
 
                 if finish_reason == "tool_calls":
+                    # Close out any open reasoning / content message group on
+                    # the wire before recursing into the tool-call round.
+                    # Otherwise a model that emitted text + tool_calls in the
+                    # same turn would leave the content message unterminated
+                    # from the WebSocket consumer's perspective.
+                    if reasoning_active and accumulated_partial_reasoning_parts:
+                        self.send_data_to_stream(
+                            index=reasoning_index,
+                            data_format="text",
+                            chunk_delta="".join(accumulated_partial_reasoning_parts),
+                            suffix=f"rs#{reasoning_no}",
+                        )
+                        accumulated_partial_reasoning_parts = []
+                        reasoning_index += 1
+                        reasoning_active = False
+                        reasoning_no += 1
+                    if accumulated_partial_text_parts:
+                        self.send_data_to_stream(
+                            index=index,
+                            data_format=output_format,
+                            chunk_delta="".join(accumulated_partial_text_parts),
+                        )
+                        accumulated_partial_text_parts = []
+                        index += 1
+                    if content_message_started:
+                        self.send_data_to_stream(
+                            index=index,
+                            data_format=output_format,
+                            is_message_end=True,
+                        )
+                        content_message_started = False
+
                     tool_calls = [
                         {
                             "id": acc["id"],
@@ -1250,6 +1318,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         # final segment that arrived without ever crossing a tag boundary).
         tail_content, tail_think = think_splitter.flush()
         if tail_think:
+            reasoning_active = True
             print(tail_think, end="", flush=True)
             accumulated_reasoning_parts.append(tail_think)
             accumulated_partial_reasoning_parts.append(tail_think)
@@ -1257,21 +1326,70 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 reasoning_index,
                 "".join(accumulated_partial_reasoning_parts),
                 "text",
-                suffix="reasoning",
+                suffix=f"rs#{reasoning_no}",
             )
             accumulated_partial_reasoning_parts = (
                 [remaining_reasoning] if remaining_reasoning else []
             )
         if tail_content:
+            # Tail content forces the same reasoning-to-content transition we
+            # do for in-flight deltas above.
+            if reasoning_active:
+                if accumulated_partial_reasoning_parts:
+                    self.send_data_to_stream(
+                        index=reasoning_index,
+                        data_format="text",
+                        chunk_delta="".join(accumulated_partial_reasoning_parts),
+                        suffix=f"rs#{reasoning_no}",
+                    )
+                    accumulated_partial_reasoning_parts = []
+                    reasoning_index += 1
+                reasoning_active = False
+                reasoning_no += 1
+            if not content_message_started:
+                content_message_started = True
+                if index == 0 and reasoning_index > 0:
+                    index = reasoning_index + 1
+                self.send_data_to_stream(
+                    index=index,
+                    data_format=output_format,
+                )
+                index += 1
             print(tail_content, end="", flush=True)
             accumulated_text_parts.append(tail_content)
+            if output_format not in ["json_object", "json_schema"]:
+                accumulated_partial_text_parts.append(tail_content)
 
-        if accumulated_partial_reasoning_parts:
+        # End-of-stream flush: leftover reasoning text, then leftover content
+        # text, then the message-end signal. Mirrors the sibling's pattern of
+        # `response.reasoning_summary_text.done` -> `response.output_text.done`
+        # -> `response.content_part.done`.
+        if reasoning_active and accumulated_partial_reasoning_parts:
             self.send_data_to_stream(
                 index=reasoning_index,
                 data_format="text",
                 chunk_delta="".join(accumulated_partial_reasoning_parts),
-                suffix="reasoning",
+                suffix=f"rs#{reasoning_no}",
+            )
+            accumulated_partial_reasoning_parts = []
+            reasoning_index += 1
+            reasoning_active = False
+            reasoning_no += 1
+
+        if accumulated_partial_text_parts:
+            self.send_data_to_stream(
+                index=index,
+                data_format=output_format,
+                chunk_delta="".join(accumulated_partial_text_parts),
+            )
+            accumulated_partial_text_parts = []
+            index += 1
+
+        if content_message_started:
+            self.send_data_to_stream(
+                index=index,
+                data_format=output_format,
+                is_message_end=True,
             )
 
         final_accumulated_text = "".join(accumulated_text_parts)
