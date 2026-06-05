@@ -211,6 +211,23 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 self.model_setting.pop("tools", None)
                 self.model_setting.pop("tool_choice", None)
                 self.model_setting.pop("parallel_tool_calls", None)
+            elif self.logger and self.logger.isEnabledFor(logging.INFO):
+                # One-time diagnostic so on-wire tool shape is visible in Lambda logs.
+                bad = [
+                    t for t in self._tools_list
+                    if not (isinstance(t, dict) and isinstance(t.get("function"), dict))
+                ]
+                self.logger.info(
+                    f"[TOOLS_LOADED] count={len(self._tools_list)} "
+                    f"malformed={len(bad)} "
+                    f"names={[(t.get('function') or {}).get('name') for t in self._tools_list]}"
+                )
+                if bad:
+                    self.logger.warning(
+                        f"[TOOLS_MALFORMED] {len(bad)} tool(s) missing nested "
+                        f"`function` field will be rejected by Chat Completions. "
+                        f"First bad tool keys: {list(bad[0].keys()) if isinstance(bad[0], dict) else type(bad[0])}"
+                    )
 
             self.instructions_role = str(config.get("instructions_role", "system"))
             self._max_tool_call_depth = int(config.get("max_tool_call_depth", 8))
