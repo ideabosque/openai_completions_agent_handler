@@ -689,7 +689,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         self,
         tool_calls: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
-        reasoning_content: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Execute a batch of tool_calls that came back from a single model turn.
@@ -723,9 +722,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 f"{[fcd['name'] for fcd in validated]}"
             )
 
-        self._append_assistant_with_tool_calls(
-            validated, input_messages, reasoning_content=reasoning_content
-        )
+        self._append_assistant_with_tool_calls(validated, input_messages)
 
         for fcd in validated:
             self._execute_and_append_result(fcd, input_messages)
@@ -925,27 +922,34 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         self,
         function_call_data_list: List[Dict[str, Any]],
         input_messages: List[Dict[str, Any]],
-        reasoning_content: Optional[str] = None,
     ) -> None:
-        """Append ONE assistant message containing every tool_call from this turn."""
-        message: Dict[str, Any] = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": fcd["id"],
-                    "type": "function",
-                    "function": {
-                        "name": fcd["name"],
-                        "arguments": fcd.get("arguments", "{}"),
-                    },
-                }
-                for fcd in function_call_data_list
-            ],
-        }
-        if reasoning_content:
-            message["reasoning_content"] = reasoning_content
-        input_messages.append(message)
+        """
+        Append ONE assistant message containing every tool_call from this turn.
+
+        Note: `reasoning_content` is intentionally NOT included on input
+        messages. It is a response-only field; echoing it back to the model
+        on the next turn is non-standard and is rejected by strict providers
+        such as Groq's openai/gpt-oss-* family and OpenAI's official Chat
+        Completions API. The reasoning trace is preserved separately in
+        `self.final_output["reasoning_summary"]` for the caller.
+        """
+        input_messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": fcd["id"],
+                        "type": "function",
+                        "function": {
+                            "name": fcd["name"],
+                            "arguments": fcd.get("arguments", "{}"),
+                        },
+                    }
+                    for fcd in function_call_data_list
+                ],
+            }
+        )
 
     def _append_tool_result(
         self,
@@ -1011,7 +1015,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     for tc in tool_calls
                 ],
                 input_messages,
-                reasoning_content=reasoning_content,
             )
             input_messages = self._trim_messages_for_recursion(input_messages)
             self.ask_model(input_messages)
@@ -1287,7 +1290,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     input_messages = self.handle_function_calls(
                         tool_calls,
                         input_messages,
-                        reasoning_content="".join(accumulated_reasoning_parts) or None,
                     )
                     input_messages = self._trim_messages_for_recursion(input_messages)
                     self.ask_model(
