@@ -26,7 +26,7 @@ class ToolCallDepthExceeded(Exception):
         self.depth = depth
         self.max_depth = max_depth
         super().__init__(
-            f"Tool call recursion depth {depth} exceeds maximum {max_depth}"
+            f"Tool call round {depth} exceeds maximum {max_depth}"
         )
 
 
@@ -580,6 +580,56 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if stream_event:
                 stream_event.set()
 
+    def _finalize_terminal_error_output(
+        self,
+        message: str,
+        message_id: Optional[str] = None,
+    ) -> str:
+        """Populate final_output for terminal handler errors."""
+        safe_message = self._redact_api_key(str(message))
+        run = getattr(self, "_run", None)
+        run_uuid = run.get("run_uuid") if isinstance(run, dict) else None
+        final_message_id = (
+            message_id
+            or getattr(self, "_last_request_id", None)
+            or run_uuid
+            or f"openai-completions-error-{pendulum.now('UTC').int_timestamp}"
+        )
+        content = f"[error] {safe_message}"
+        self.final_output.update(
+            {
+                "message_id": final_message_id,
+                "role": "assistant",
+                "content": content,
+            }
+        )
+        self.accumulated_text = content
+        return final_message_id
+
+    def _stop_before_tool_round_limit(
+        self,
+        completed_tool_rounds: int,
+        queue: Queue = None,
+        stream_event: threading.Event = None,
+    ) -> str | None:
+        """Stop an iterative tool loop before starting an over-limit round."""
+        if completed_tool_rounds < self._max_tool_call_depth:
+            return None
+
+        attempted_round = completed_tool_rounds + 1
+        exc = ToolCallDepthExceeded(attempted_round, self._max_tool_call_depth)
+        safe_msg = self._redact_api_key(str(exc))
+        if self.logger and self.logger.isEnabledFor(logging.WARNING):
+            self.logger.warning(
+                "Stopping tool-call loop before round %s exceeds max %s",
+                attempted_round,
+                self._max_tool_call_depth,
+            )
+        run_id = self._finalize_terminal_error_output(safe_msg)
+        if queue is not None:
+            self._send_terminal_stream_error(safe_msg, stream_event)
+        return run_id
+
     @performance_monitor.monitor_operation(operation_name="OpenAICompletions")
     def ask_model(
         self,
@@ -600,13 +650,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         if self._ask_model_depth > self._max_tool_call_depth:
             attempted_depth = self._ask_model_depth
             exc = ToolCallDepthExceeded(attempted_depth, self._max_tool_call_depth)
-            if is_top_level and queue is not None:
-                self._send_terminal_stream_error(
-                    self._redact_api_key(str(exc)),
-                    stream_event,
-                )
+            safe_msg = self._redact_api_key(str(exc))
+            run_id = self._finalize_terminal_error_output(safe_msg)
+            if queue is not None:
+                self._send_terminal_stream_error(safe_msg, stream_event)
             self._ask_model_depth -= 1
-            raise exc
+            return run_id
 
         if is_top_level and self.enable_timeline_log:
             self._global_start_time = ask_model_start
@@ -651,31 +700,49 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     f"[TIMELINE] T+{elapsed:.2f}ms: Preparation complete (took {preparation_time:.2f}ms)"
                 )
 
-            call_start = pendulum.now("UTC")
-            response = self.invoke_model(
-                messages=input_messages,
-                stream=stream,
-            )
-            latency_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
-            self._last_latency_ms = latency_ms
-
             run_id = None
-            if stream:
-                run_id = self.handle_stream(
-                    response,
-                    input_messages,
-                    queue=queue,
-                    stream_event=stream_event,
-                )
-            else:
-                run_id = self.handle_response(response, input_messages)
+            completed_tool_rounds = 0
+            while True:
+                self._tool_loop_continue = False
+                self._next_input_messages = None
 
-            return run_id
+                call_start = pendulum.now("UTC")
+                response = self.invoke_model(
+                    messages=input_messages,
+                    stream=stream,
+                )
+                latency_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
+                self._last_latency_ms = latency_ms
+
+                if stream:
+                    run_id = self.handle_stream(
+                        response,
+                        input_messages,
+                        queue=queue,
+                        stream_event=stream_event,
+                    )
+                else:
+                    run_id = self.handle_response(response, input_messages)
+
+                if not getattr(self, "_tool_loop_continue", False):
+                    return run_id
+
+                completed_tool_rounds += 1
+                terminal_run_id = self._stop_before_tool_round_limit(
+                    completed_tool_rounds,
+                    queue=queue if stream else None,
+                    stream_event=stream_event if stream else None,
+                )
+                if terminal_run_id is not None:
+                    return terminal_run_id
+
+                input_messages = self._next_input_messages or input_messages
         except ToolCallDepthExceeded as e:
             safe_msg = self._redact_api_key(str(e))
+            run_id = self._finalize_terminal_error_output(safe_msg)
             if is_top_level and stream:
                 self._send_terminal_stream_error(safe_msg, stream_event)
-            raise
+            return run_id
         except openai.APIError as e:
             safe_msg = self._redact_api_key(str(e))
             if is_top_level and stream:
@@ -1054,8 +1121,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 ],
                 input_messages,
             )
-            input_messages = self._trim_messages_for_recursion(input_messages)
-            self.ask_model(input_messages)
+            self._next_input_messages = self._trim_messages_for_recursion(input_messages)
+            self._tool_loop_continue = True
             return response.id
 
         if finish_reason == "length":
@@ -1329,10 +1396,10 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         tool_calls,
                         input_messages,
                     )
-                    input_messages = self._trim_messages_for_recursion(input_messages)
-                    self.ask_model(
-                        input_messages, queue=queue, stream_event=stream_event
+                    self._next_input_messages = self._trim_messages_for_recursion(
+                        input_messages
                     )
+                    self._tool_loop_continue = True
                     return run_id
 
                 if finish_reason == "length":
