@@ -555,6 +555,30 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         input_messages[-1] = {**last, "content": content}
         return input_messages
 
+
+    def _send_terminal_stream_error(
+        self,
+        message: str,
+        stream_event: threading.Event = None,
+    ) -> None:
+        """Emit a final stream frame when ask_model fails mid-stream."""
+        try:
+            self.send_data_to_stream(
+                index=0,
+                data_format="text",
+                chunk_delta=f"\n[error] {message}",
+                is_message_end=True,
+            )
+        except Exception as exc:
+            if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning(
+                    "Failed to emit terminal stream error frame: %s",
+                    exc,
+                )
+        finally:
+            if stream_event:
+                stream_event.set()
+
     @performance_monitor.monitor_operation(operation_name="OpenAICompletions")
     def ask_model(
         self,
@@ -573,10 +597,15 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         is_top_level = self._ask_model_depth == 1
 
         if self._ask_model_depth > self._max_tool_call_depth:
+            attempted_depth = self._ask_model_depth
+            exc = ToolCallDepthExceeded(attempted_depth, self._max_tool_call_depth)
+            if is_top_level and queue is not None:
+                self._send_terminal_stream_error(
+                    self._redact_api_key(str(exc)),
+                    stream_event,
+                )
             self._ask_model_depth -= 1
-            raise ToolCallDepthExceeded(
-                self._ask_model_depth, self._max_tool_call_depth
-            )
+            raise exc
 
         if is_top_level and self.enable_timeline_log:
             self._global_start_time = ask_model_start
@@ -641,12 +670,22 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 run_id = self.handle_response(response, input_messages)
 
             return run_id
-        except (ToolCallDepthExceeded, openai.APIError):
+        except ToolCallDepthExceeded as e:
+            safe_msg = self._redact_api_key(str(e))
+            if is_top_level and stream:
+                self._send_terminal_stream_error(safe_msg, stream_event)
+            raise
+        except openai.APIError as e:
+            safe_msg = self._redact_api_key(str(e))
+            if is_top_level and stream:
+                self._send_terminal_stream_error(safe_msg, stream_event)
             raise
         except Exception as e:
             safe_msg = self._redact_api_key(str(e))
             if self.logger and self.logger.isEnabledFor(logging.ERROR):
                 self.logger.error(f"Error in ask_model: {safe_msg}")
+            if is_top_level and stream:
+                self._send_terminal_stream_error(safe_msg, stream_event)
             raise Exception(f"Failed to process model request: {safe_msg}")
         finally:
             self._ask_model_depth -= 1
