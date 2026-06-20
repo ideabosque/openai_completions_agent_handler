@@ -4,14 +4,13 @@ from __future__ import annotations
 
 __author__ = "bibow"
 
-import json
 import logging
 import re
 import threading
 import traceback
 from decimal import Decimal
 from queue import Queue
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import httpx
 import openai
@@ -76,12 +75,14 @@ class _ThinkTagSplitter:
                 if idx == -1:
                     keep = self._partial_tag_suffix(self.buffer, self.OPEN)
                     if len(self.buffer) > keep:
-                        content_parts.append(self.buffer[:-keep] if keep else self.buffer)
+                        content_parts.append(
+                            self.buffer[:-keep] if keep else self.buffer
+                        )
                         self.buffer = self.buffer[-keep:] if keep else ""
                     break
                 if idx > 0:
                     content_parts.append(self.buffer[:idx])
-                self.buffer = self.buffer[idx + len(self.OPEN):]
+                self.buffer = self.buffer[idx + len(self.OPEN) :]
                 self.in_think = True
             else:
                 idx = self.buffer.find(self.CLOSE)
@@ -93,7 +94,7 @@ class _ThinkTagSplitter:
                     break
                 if idx > 0:
                     think_parts.append(self.buffer[:idx])
-                self.buffer = self.buffer[idx + len(self.CLOSE):]
+                self.buffer = self.buffer[idx + len(self.CLOSE) :]
                 self.in_think = False
         return "".join(content_parts), "".join(think_parts)
 
@@ -215,7 +216,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             elif self.logger and self.logger.isEnabledFor(logging.INFO):
                 # One-time diagnostic so on-wire tool shape is visible in Lambda logs.
                 bad = [
-                    t for t in self._tools_list
+                    t
+                    for t in self._tools_list
                     if not (isinstance(t, dict) and isinstance(t.get("function"), dict))
                 ]
                 self.logger.info(
@@ -555,7 +557,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         input_messages[-1] = {**last, "content": content}
         return input_messages
 
-
     def _send_terminal_stream_error(
         self,
         message: str,
@@ -827,9 +828,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 and self.logger
                 and self.logger.isEnabledFor(logging.INFO)
             ):
-                call_ms = (
-                    pendulum.now("UTC") - call_start
-                ).total_seconds() * 1000
+                call_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
                 elapsed = self._get_elapsed_time()
                 self.logger.info(
                     f"[TIMELINE] T+{elapsed:.2f}ms: Function '{function_call_data['name']}' complete (took {call_ms:.2f}ms)"
@@ -1121,9 +1120,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         # Optional fallback for compatible servers that emit inline <think>
         # tags instead of the provider's dedicated reasoning_content field.
         # Off by default; enable via configuration.enable_think_tag_split.
-        think_splitter = (
-            _ThinkTagSplitter() if self._enable_think_tag_split else None
-        )
+        think_splitter = _ThinkTagSplitter() if self._enable_think_tag_split else None
 
         # WebSocket lifecycle state matching openai_agent_handler's pattern.
         content_message_started = False
@@ -1236,7 +1233,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     else:
                         accumulated_partial_text_parts.append(content_part)
                         index, remaining_text = self.process_text_content(
-                            index, "".join(accumulated_partial_text_parts), output_format
+                            index,
+                            "".join(accumulated_partial_text_parts),
+                            output_format,
                         )
                         accumulated_partial_text_parts = (
                             [remaining_text] if remaining_text else []
@@ -1448,6 +1447,20 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             )
 
         final_accumulated_text = "".join(accumulated_text_parts)
+
+        if (
+            self.enable_timeline_log
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
+            stream_duration_ms = (
+                pendulum.now("UTC") - stream_start_time
+            ).total_seconds() * 1000
+            elapsed = self._get_elapsed_time()
+            self.logger.info(
+                f"[TIMELINE] T+{elapsed:.2f}ms: Stream completed, run_id={run_id} "
+                f"(took {stream_duration_ms:.2f}ms from stream start)"
+            )
 
         self._last_request_id = run_id
         self._log_model_call(
