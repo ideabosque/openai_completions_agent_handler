@@ -152,6 +152,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 config["tools"] = self._normalize_tools_to_chat_completions(
                     config["tools"]
                 )
+                # Sort tools by function name for deterministic ordering.
+                # This maximizes prefix-cache hits on Together.ai (prefix-based caching).
+                config["tools"].sort(
+                    key=lambda t: t.get("function", {}).get("name", "")
+                )
 
             if "enabled_tools" in config:
                 enabled_set = set(config["enabled_tools"])
