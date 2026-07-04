@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __author__ = "bibow"
 
+import json
 import logging
 import re
 import threading
@@ -26,7 +27,7 @@ class ToolCallDepthExceeded(Exception):
         self.depth = depth
         self.max_depth = max_depth
         super().__init__(
-            f"Tool call recursion depth {depth} exceeds maximum {max_depth}"
+            f"Tool call round {depth} exceeds maximum {max_depth}"
         )
 
 
@@ -151,6 +152,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if "tools" in config and config["tools"]:
                 config["tools"] = self._normalize_tools_to_chat_completions(
                     config["tools"]
+                )
+                # Sort tools by function name for deterministic ordering.
+                # This maximizes prefix-cache hits on Together.ai (prefix-based caching).
+                config["tools"].sort(
+                    key=lambda t: t.get("function", {}).get("name", "")
                 )
 
             if "enabled_tools" in config:
@@ -580,6 +586,56 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if stream_event:
                 stream_event.set()
 
+    def _finalize_terminal_error_output(
+        self,
+        message: str,
+        message_id: Optional[str] = None,
+    ) -> str:
+        """Populate final_output for terminal handler errors."""
+        safe_message = self._redact_api_key(str(message))
+        run = getattr(self, "_run", None)
+        run_uuid = run.get("run_uuid") if isinstance(run, dict) else None
+        final_message_id = (
+            message_id
+            or getattr(self, "_last_request_id", None)
+            or run_uuid
+            or f"openai-completions-error-{pendulum.now('UTC').int_timestamp}"
+        )
+        content = f"[error] {safe_message}"
+        self.final_output.update(
+            {
+                "message_id": final_message_id,
+                "role": "assistant",
+                "content": content,
+            }
+        )
+        self.accumulated_text = content
+        return final_message_id
+
+    def _stop_before_tool_round_limit(
+        self,
+        completed_tool_rounds: int,
+        queue: Queue = None,
+        stream_event: threading.Event = None,
+    ) -> str | None:
+        """Stop an iterative tool loop before starting an over-limit round."""
+        if completed_tool_rounds < self._max_tool_call_depth:
+            return None
+
+        attempted_round = completed_tool_rounds + 1
+        exc = ToolCallDepthExceeded(attempted_round, self._max_tool_call_depth)
+        safe_msg = self._redact_api_key(str(exc))
+        if self.logger and self.logger.isEnabledFor(logging.WARNING):
+            self.logger.warning(
+                "Stopping tool-call loop before round %s exceeds max %s",
+                attempted_round,
+                self._max_tool_call_depth,
+            )
+        run_id = self._finalize_terminal_error_output(safe_msg)
+        if queue is not None:
+            self._send_terminal_stream_error(safe_msg, stream_event)
+        return run_id
+
     @performance_monitor.monitor_operation(operation_name="OpenAICompletions")
     def ask_model(
         self,
@@ -600,13 +656,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         if self._ask_model_depth > self._max_tool_call_depth:
             attempted_depth = self._ask_model_depth
             exc = ToolCallDepthExceeded(attempted_depth, self._max_tool_call_depth)
-            if is_top_level and queue is not None:
-                self._send_terminal_stream_error(
-                    self._redact_api_key(str(exc)),
-                    stream_event,
-                )
+            safe_msg = self._redact_api_key(str(exc))
+            run_id = self._finalize_terminal_error_output(safe_msg)
+            if queue is not None:
+                self._send_terminal_stream_error(safe_msg, stream_event)
             self._ask_model_depth -= 1
-            raise exc
+            return run_id
 
         if is_top_level and self.enable_timeline_log:
             self._global_start_time = ask_model_start
@@ -651,31 +706,49 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     f"[TIMELINE] T+{elapsed:.2f}ms: Preparation complete (took {preparation_time:.2f}ms)"
                 )
 
-            call_start = pendulum.now("UTC")
-            response = self.invoke_model(
-                messages=input_messages,
-                stream=stream,
-            )
-            latency_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
-            self._last_latency_ms = latency_ms
-
             run_id = None
-            if stream:
-                run_id = self.handle_stream(
-                    response,
-                    input_messages,
-                    queue=queue,
-                    stream_event=stream_event,
-                )
-            else:
-                run_id = self.handle_response(response, input_messages)
+            completed_tool_rounds = 0
+            while True:
+                self._tool_loop_continue = False
+                self._next_input_messages = None
 
-            return run_id
+                call_start = pendulum.now("UTC")
+                response = self.invoke_model(
+                    messages=input_messages,
+                    stream=stream,
+                )
+                latency_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
+                self._last_latency_ms = latency_ms
+
+                if stream:
+                    run_id = self.handle_stream(
+                        response,
+                        input_messages,
+                        queue=queue,
+                        stream_event=stream_event,
+                    )
+                else:
+                    run_id = self.handle_response(response, input_messages)
+
+                if not getattr(self, "_tool_loop_continue", False):
+                    return run_id
+
+                completed_tool_rounds += 1
+                terminal_run_id = self._stop_before_tool_round_limit(
+                    completed_tool_rounds,
+                    queue=queue if stream else None,
+                    stream_event=stream_event if stream else None,
+                )
+                if terminal_run_id is not None:
+                    return terminal_run_id
+
+                input_messages = self._next_input_messages or input_messages
         except ToolCallDepthExceeded as e:
             safe_msg = self._redact_api_key(str(e))
+            run_id = self._finalize_terminal_error_output(safe_msg)
             if is_top_level and stream:
                 self._send_terminal_stream_error(safe_msg, stream_event)
-            raise
+            return run_id
         except openai.APIError as e:
             safe_msg = self._redact_api_key(str(e))
             if is_top_level and stream:
@@ -846,6 +919,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
     ) -> Dict[str, Any]:
         try:
             arguments = Serializer.json_loads(function_call_data.get("arguments", "{}"))
+            # Schema-driven coercion runs first — precise, only touches values
+            # whose expected type the tool schema explicitly declares.
+            arguments = self._coerce_arguments_to_schema(
+                function_call_data.get("name", ""), arguments
+            )
+            # Heuristic fallback for anything the schema didn't cover.
+            arguments = self._unwrap_stringified_json(arguments)
             return arguments
         except Exception as e:
             log = traceback.format_exc()
@@ -863,6 +943,155 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if self.logger and self.logger.isEnabledFor(logging.ERROR):
                 self.logger.error("Error parsing function arguments: %s", e)
             raise ValueError(f"Failed to parse function arguments: {e}")
+
+    def _get_tool_parameters_schema(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the `parameters` JSON schema for a registered tool, or None."""
+        if not name:
+            return None
+        for tool in self.model_setting.get("tools") or []:
+            function = tool.get("function") or {}
+            if function.get("name") == name:
+                return function.get("parameters")
+        return None
+
+    def _coerce_arguments_to_schema(
+        self, name: str, arguments: Any
+    ) -> Any:
+        """Apply schema-driven coercion to LLM-emitted arguments."""
+        schema = self._get_tool_parameters_schema(name)
+        if not isinstance(schema, dict):
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[SCHEMA_COERCE] no schema found for tool={name!r}; "
+                    f"registered tools={[((t.get('function') or {}).get('name')) for t in (self.model_setting.get('tools') or [])]}"
+                )
+            return arguments
+        coerced = self._coerce_to_schema(arguments, schema)
+        if coerced != arguments and self.logger and self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"[SCHEMA_COERCE] tool={name!r} coerced "
+                f"before={_truncate(Serializer.json_dumps(arguments))} "
+                f"after={_truncate(Serializer.json_dumps(coerced))}"
+            )
+        return coerced
+
+    @staticmethod
+    def _coerce_to_schema(value: Any, schema: Dict[str, Any]) -> Any:
+        """
+        Coerce a value to match its expected JSON-schema type.
+
+        Handles the specific coercions LLMs get wrong most often:
+          - string containing a JSON array/object -> the parsed array/object
+          - string containing a number             -> integer / number
+          - string "true"/"false"                  -> boolean
+
+        Recurses into declared object properties and array items. Anything
+        without a schema (or where the schema doesn't demand a different
+        type) is returned unchanged, so this is safe to run alongside the
+        heuristic _unwrap_stringified_json fallback.
+        """
+        expected = schema.get("type") if isinstance(schema, dict) else None
+        if expected is None:
+            return value
+
+        # Handle union types by trying each until one produces a change.
+        if isinstance(expected, list):
+            for t in expected:
+                if t in {"array", "object", "integer", "number", "boolean"}:
+                    coerced = OpenAICompletionsEventHandler._coerce_to_schema(
+                        value, {**schema, "type": t}
+                    )
+                    if coerced is not value:
+                        return coerced
+            return value
+
+        if expected == "array" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "object" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "integer" and isinstance(value, str):
+            try:
+                return int(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "number" and isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "boolean" and isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"true", "false"}:
+                return s == "true"
+            return value
+
+        # Recurse into structured types when the shape now matches the schema.
+        if expected == "object" and isinstance(value, dict):
+            properties = schema.get("properties") or {}
+            return {
+                k: OpenAICompletionsEventHandler._coerce_to_schema(
+                    v, properties.get(k, {})
+                )
+                for k, v in value.items()
+            }
+        if expected == "array" and isinstance(value, list):
+            items_schema = schema.get("items") or {}
+            return [
+                OpenAICompletionsEventHandler._coerce_to_schema(item, items_schema)
+                for item in value
+            ]
+
+        return value
+
+    @staticmethod
+    def _unwrap_stringified_json(obj: Any) -> Any:
+        """
+        Some LLMs (notably smaller/instruction-tuned Ollama / GPT-OSS models)
+        double-encode array or object parameters: they emit a JSON *string*
+        containing a JSON array/object where the tool schema expects the raw
+        array/object. The MCP layer then rejects the argument with
+
+            'includeDomains: expected array, received string'
+
+        This walks the parsed arguments and json.loads any string whose
+        stripped content starts with `[`/`{` and ends with `]`/`}`. Non-JSON
+        strings, strings that happen to start with `[` but fail json.loads,
+        and non-string primitives are passed through unchanged.
+        """
+        if isinstance(obj, dict):
+            return {
+                k: OpenAICompletionsEventHandler._unwrap_stringified_json(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [
+                OpenAICompletionsEventHandler._unwrap_stringified_json(v)
+                for v in obj
+            ]
+        if isinstance(obj, str):
+            stripped = obj.strip()
+            if (stripped.startswith("[") and stripped.endswith("]")) or (
+                stripped.startswith("{") and stripped.endswith("}")
+            ):
+                try:
+                    parsed = json.loads(stripped)
+                    # Recurse in case of triple-encoding (rare but observed).
+                    return OpenAICompletionsEventHandler._unwrap_stringified_json(
+                        parsed
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    return obj
+        return obj
 
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]
@@ -1054,8 +1283,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 ],
                 input_messages,
             )
-            input_messages = self._trim_messages_for_recursion(input_messages)
-            self.ask_model(input_messages)
+            self._next_input_messages = self._trim_messages_for_recursion(input_messages)
+            self._tool_loop_continue = True
             return response.id
 
         if finish_reason == "length":
@@ -1329,10 +1558,10 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         tool_calls,
                         input_messages,
                     )
-                    input_messages = self._trim_messages_for_recursion(input_messages)
-                    self.ask_model(
-                        input_messages, queue=queue, stream_event=stream_event
+                    self._next_input_messages = self._trim_messages_for_recursion(
+                        input_messages
                     )
+                    self._tool_loop_continue = True
                     return run_id
 
                 if finish_reason == "length":
