@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __author__ = "bibow"
 
+import json
 import logging
 import re
 import threading
@@ -151,6 +152,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if "tools" in config and config["tools"]:
                 config["tools"] = self._normalize_tools_to_chat_completions(
                     config["tools"]
+                )
+                # Sort tools by function name for deterministic ordering.
+                # This maximizes prefix-cache hits on Together.ai (prefix-based caching).
+                config["tools"].sort(
+                    key=lambda t: t.get("function", {}).get("name", "")
                 )
 
             if "enabled_tools" in config:
@@ -913,6 +919,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
     ) -> Dict[str, Any]:
         try:
             arguments = Serializer.json_loads(function_call_data.get("arguments", "{}"))
+            # Schema-driven coercion runs first — precise, only touches values
+            # whose expected type the tool schema explicitly declares.
+            arguments = self._coerce_arguments_to_schema(
+                function_call_data.get("name", ""), arguments
+            )
+            # Heuristic fallback for anything the schema didn't cover.
+            arguments = self._unwrap_stringified_json(arguments)
             return arguments
         except Exception as e:
             log = traceback.format_exc()
@@ -930,6 +943,155 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if self.logger and self.logger.isEnabledFor(logging.ERROR):
                 self.logger.error("Error parsing function arguments: %s", e)
             raise ValueError(f"Failed to parse function arguments: {e}")
+
+    def _get_tool_parameters_schema(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the `parameters` JSON schema for a registered tool, or None."""
+        if not name:
+            return None
+        for tool in self.model_setting.get("tools") or []:
+            function = tool.get("function") or {}
+            if function.get("name") == name:
+                return function.get("parameters")
+        return None
+
+    def _coerce_arguments_to_schema(
+        self, name: str, arguments: Any
+    ) -> Any:
+        """Apply schema-driven coercion to LLM-emitted arguments."""
+        schema = self._get_tool_parameters_schema(name)
+        if not isinstance(schema, dict):
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[SCHEMA_COERCE] no schema found for tool={name!r}; "
+                    f"registered tools={[((t.get('function') or {}).get('name')) for t in (self.model_setting.get('tools') or [])]}"
+                )
+            return arguments
+        coerced = self._coerce_to_schema(arguments, schema)
+        if coerced != arguments and self.logger and self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"[SCHEMA_COERCE] tool={name!r} coerced "
+                f"before={_truncate(Serializer.json_dumps(arguments))} "
+                f"after={_truncate(Serializer.json_dumps(coerced))}"
+            )
+        return coerced
+
+    @staticmethod
+    def _coerce_to_schema(value: Any, schema: Dict[str, Any]) -> Any:
+        """
+        Coerce a value to match its expected JSON-schema type.
+
+        Handles the specific coercions LLMs get wrong most often:
+          - string containing a JSON array/object -> the parsed array/object
+          - string containing a number             -> integer / number
+          - string "true"/"false"                  -> boolean
+
+        Recurses into declared object properties and array items. Anything
+        without a schema (or where the schema doesn't demand a different
+        type) is returned unchanged, so this is safe to run alongside the
+        heuristic _unwrap_stringified_json fallback.
+        """
+        expected = schema.get("type") if isinstance(schema, dict) else None
+        if expected is None:
+            return value
+
+        # Handle union types by trying each until one produces a change.
+        if isinstance(expected, list):
+            for t in expected:
+                if t in {"array", "object", "integer", "number", "boolean"}:
+                    coerced = OpenAICompletionsEventHandler._coerce_to_schema(
+                        value, {**schema, "type": t}
+                    )
+                    if coerced is not value:
+                        return coerced
+            return value
+
+        if expected == "array" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "object" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "integer" and isinstance(value, str):
+            try:
+                return int(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "number" and isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "boolean" and isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"true", "false"}:
+                return s == "true"
+            return value
+
+        # Recurse into structured types when the shape now matches the schema.
+        if expected == "object" and isinstance(value, dict):
+            properties = schema.get("properties") or {}
+            return {
+                k: OpenAICompletionsEventHandler._coerce_to_schema(
+                    v, properties.get(k, {})
+                )
+                for k, v in value.items()
+            }
+        if expected == "array" and isinstance(value, list):
+            items_schema = schema.get("items") or {}
+            return [
+                OpenAICompletionsEventHandler._coerce_to_schema(item, items_schema)
+                for item in value
+            ]
+
+        return value
+
+    @staticmethod
+    def _unwrap_stringified_json(obj: Any) -> Any:
+        """
+        Some LLMs (notably smaller/instruction-tuned Ollama / GPT-OSS models)
+        double-encode array or object parameters: they emit a JSON *string*
+        containing a JSON array/object where the tool schema expects the raw
+        array/object. The MCP layer then rejects the argument with
+
+            'includeDomains: expected array, received string'
+
+        This walks the parsed arguments and json.loads any string whose
+        stripped content starts with `[`/`{` and ends with `]`/`}`. Non-JSON
+        strings, strings that happen to start with `[` but fail json.loads,
+        and non-string primitives are passed through unchanged.
+        """
+        if isinstance(obj, dict):
+            return {
+                k: OpenAICompletionsEventHandler._unwrap_stringified_json(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [
+                OpenAICompletionsEventHandler._unwrap_stringified_json(v)
+                for v in obj
+            ]
+        if isinstance(obj, str):
+            stripped = obj.strip()
+            if (stripped.startswith("[") and stripped.endswith("]")) or (
+                stripped.startswith("{") and stripped.endswith("}")
+            ):
+                try:
+                    parsed = json.loads(stripped)
+                    # Recurse in case of triple-encoding (rare but observed).
+                    return OpenAICompletionsEventHandler._unwrap_stringified_json(
+                        parsed
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    return obj
+        return obj
 
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]
