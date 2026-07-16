@@ -653,6 +653,25 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         self._ask_model_depth += 1
         is_top_level = self._ask_model_depth == 1
 
+        # Establish per-run state here rather than relying on __init__:
+        # handler instances are cached and reused across requests, so building
+        # these in __init__ and mutating them in place (final_output.update(...))
+        # meant concurrent runs shared one set of containers and overwrote each
+        # other's results — final_output *is* the response payload. Rebinding,
+        # never mutating, is what isolates each run.
+        #
+        # Only at top level: this method recurses for tool-call follow-ups, and
+        # final_output / _short_term_memory accumulate across those levels.
+        #
+        # Inlined rather than a base-class helper on purpose: ai_agent_handler
+        # is a separately installed package, so calling a new base method would
+        # raise AttributeError wherever that package is older than this one.
+        if is_top_level:
+            self.accumulated_text = ""
+            self.final_output = {}
+            self.uploaded_files = []
+            self._short_term_memory = []
+
         if self._ask_model_depth > self._max_tool_call_depth:
             attempted_depth = self._ask_model_depth
             exc = ToolCallDepthExceeded(attempted_depth, self._max_tool_call_depth)
@@ -687,7 +706,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             stream = True if queue is not None else False
 
             if model_setting:
-                self.model_setting.update(model_setting)
+                # Rebind rather than mutate: model_setting is built once in
+                # __init__ and shared with every other instance of this cached
+                # handler, so an in-place update would leak this request's
+                # overrides into all later requests.
+                self.model_setting = {**self.model_setting, **model_setting}
                 self._tools_cache_valid = False
 
             if input_images:
