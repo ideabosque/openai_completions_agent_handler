@@ -26,9 +26,7 @@ class ToolCallDepthExceeded(Exception):
     def __init__(self, depth: int, max_depth: int):
         self.depth = depth
         self.max_depth = max_depth
-        super().__init__(
-            f"Tool call round {depth} exceeds maximum {max_depth}"
-        )
+        super().__init__(f"Tool call round {depth} exceeds maximum {max_depth}")
 
 
 def _omit_none(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,8 +468,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         required `tool_call_id` field BEFORE sending to the provider.
 
         Without this, a malformed message reaches the server and comes back as
-        a generic 400 `missing field \`tool_call_id\`` (e.g. Together.ai GLM:
-        `messages[N]: missing field \`tool_call_id\` at line 1 column 89231`)
+        a generic 400 `missing field 'tool_call_id'` (e.g. Together.ai GLM:
+        `messages[N]: missing field 'tool_call_id' at line 1 column 89231`)
         with no indication of who emitted the bad message. Raising here with
         the offending index and a content preview turns it into a loud,
         debuggable client-side error so the upstream emitter can be found.
@@ -486,7 +484,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         for i, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
-            if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+            if msg.get("role") == "assistant" and isinstance(
+                msg.get("tool_calls"), list
+            ):
                 for tc in msg["tool_calls"]:
                     if isinstance(tc, dict) and tc.get("id"):
                         parent_ids.add(tc["id"])
@@ -539,15 +539,30 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             # provider rejects them with an opaque 400. See _validate_tool_messages.
             self._validate_tool_messages(messages)
 
+            # Ensure tool_calls[].function.arguments is a JSON string per the
+            # OpenAI Chat Completions spec.  Together.ai's deserializer rejects
+            # dict/object values with a 400; their GLM-5.2 Jinja2 template also
+            # calls .items() on the value and fails on a string.  This is a
+            # Together.ai server bug — their template should json.loads the
+            # string before traversal.  We send the spec-compliant string form;
+            # providers that follow the spec (OpenAI, vLLM, SGLang) accept it.
+            for msg in messages:
+                if msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        func = tc.get("function")
+                        if func and not isinstance(func.get("arguments"), str):
+                            func["arguments"] = json.dumps(
+                                func["arguments"], ensure_ascii=False
+                            )
+
             if payload.get("stream"):
                 payload["stream_options"] = {"include_usage": True}
             else:
                 payload.pop("stream_options", None)
 
             if (
-                # self._debug_log_request_messages
-                # and 
-                self.logger
+                self._debug_log_request_messages
+                and self.logger
                 and self.logger.isEnabledFor(logging.INFO)
             ):
                 try:
@@ -1050,9 +1065,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 return function.get("parameters")
         return None
 
-    def _coerce_arguments_to_schema(
-        self, name: str, arguments: Any
-    ) -> Any:
+    def _coerce_arguments_to_schema(self, name: str, arguments: Any) -> Any:
         """Apply schema-driven coercion to LLM-emitted arguments."""
         schema = self._get_tool_parameters_schema(name)
         if not isinstance(schema, dict):
@@ -1063,7 +1076,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 )
             return arguments
         coerced = self._coerce_to_schema(arguments, schema)
-        if coerced != arguments and self.logger and self.logger.isEnabledFor(logging.INFO):
+        if (
+            coerced != arguments
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
             self.logger.info(
                 f"[SCHEMA_COERCE] tool={name!r} coerced "
                 f"before={_truncate(Serializer.json_dumps(arguments))} "
@@ -1171,8 +1188,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             }
         if isinstance(obj, list):
             return [
-                OpenAICompletionsEventHandler._unwrap_stringified_json(v)
-                for v in obj
+                OpenAICompletionsEventHandler._unwrap_stringified_json(v) for v in obj
             ]
         if isinstance(obj, str):
             stripped = obj.strip()
@@ -1188,6 +1204,43 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 except (json.JSONDecodeError, ValueError):
                     return obj
         return obj
+
+    @staticmethod
+    def _normalize_tool_output_for_llm(output: Any) -> Any:
+        """
+        Convert MCP text-content tool results into the payload the model should see.
+
+        MCP HTTP tool calls commonly return a content-part list such as
+        [{"type": "text", "text": "{\"request_uuid\":\"...\"}"}]. Sending
+        that nested wrapper back as the Chat Completions tool result makes the
+        model see MCP transport metadata instead of the actual tool output.
+        """
+        if not isinstance(output, list) or not output:
+            return output
+
+        text_parts: List[str] = []
+        for item in output:
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                return output
+            text_parts.append(item["text"])
+
+        if len(text_parts) != 1:
+            return "\n".join(text_parts)
+
+        text = text_parts[0]
+        stripped = text.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        ):
+            try:
+                return json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return text
 
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]
@@ -1229,6 +1282,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             function_output = agent_function(**arguments)
             exec_ms = (pendulum.now("UTC") - exec_start).total_seconds() * 1000
 
+            function_output = self._normalize_tool_output_for_llm(function_output)
             serialized_output = Serializer.json_dumps(function_output)
 
             if self.logger and self.logger.isEnabledFor(logging.INFO):
@@ -1282,27 +1336,27 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             return error_msg, Serializer.json_dumps(error_msg)
 
     @staticmethod
-    def _coerce_tool_call_arguments(raw: str) -> Any:
+    def _coerce_tool_call_arguments(raw: str) -> str:
         """
-        Parse a tool_call's `arguments` JSON string into a dict when possible.
+        Ensure tool_call arguments is a valid JSON string per the OpenAI
+        Chat Completions spec.
 
-        Some provider chat templates (notably Together.ai's GLM-5.2 Jinja
-        template) crash with `invalid operation: object is not callable`
-        when `tool_calls[].function.arguments` arrives as a JSON *string*
-        instead of a parsed object. The OpenAI Chat Completions spec allows
-        either, but GLM's template treats it as a dict and tries to call
-        into it. Parsing here is safe for spec-compliant servers too: they
-        re-serialize dicts back to strings on the wire.
+        The spec requires `arguments` to be a JSON-encoded string.  Some
+        providers (Together.ai, vLLM) reject dict/object values with a 400
+        error.  This method validates the string is parseable JSON and
+        returns it as-is.
 
-        If parsing fails, return the original string unchanged so we never
-        silently corrupt a value the model actually sent as a string.
+        Note: GLM-5.2's Jinja2 template calls .items() on the value and fails
+        on a string — that is a Together.ai server bug (they should json.loads
+        the string before template traversal).  We stay spec-compliant here.
         """
         if not isinstance(raw, str):
             return raw
         try:
-            return json.loads(raw)
+            json.loads(raw)
         except (json.JSONDecodeError, ValueError):
-            return raw
+            pass
+        return raw
 
     def _append_assistant_with_tool_calls(
         self,
@@ -1319,11 +1373,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         Completions API. The reasoning trace is preserved separately in
         `self.final_output["reasoning_summary"]` for the caller.
 
-        `arguments` is parsed to a dict when it is valid JSON, as a workaround
-        for provider chat templates (GLM-5.2 on Together.ai) that reject string
-        arguments with `Failed to apply chat template: invalid operation:
-        object is not callable`. Spec-compliant servers re-serialize dicts
-        back to strings on the wire, so this is safe for everyone.
+        `arguments` is kept as a JSON string per the OpenAI Chat Completions
+        spec.  Provider deserializers (Together.ai, vLLM) reject dict/object
+        values with a 400 error.  GLM-5.2's Jinja2 template calls .items() on
+        the value and fails on a string — that is a Together.ai server bug.
+        invoke_model() also stringifies any dict arguments before the API call.
         """
         input_messages.append(
             {
@@ -1410,7 +1464,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 ],
                 input_messages,
             )
-            self._next_input_messages = self._trim_messages_for_recursion(input_messages)
+            self._next_input_messages = self._trim_messages_for_recursion(
+                input_messages
+            )
             self._tool_loop_continue = True
             return response.id
 
