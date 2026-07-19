@@ -146,6 +146,11 @@
             "default": false,
             "description": "When true, the streaming handler scans content for inline <think>...</think> blocks and routes them to the reasoning channel. Enable only for servers that fail to populate delta.reasoning_content and emit raw <think> tags instead (e.g. vLLM with GLM-5 hitting parser bug #29763, DeepSeek/Qwen3 without a reasoning parser flag). Off by default."
         },
+        "debug_log_request_messages": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, log a truncated JSON dump of the `messages` array (up to 8000 chars) before every chat.completions.create() call, tagged [REQUEST_MESSAGES]. Diagnostic only — use to inspect on-wire message shape when a provider rejects the request. Off by default; noisy in production."
+        },
         "instructions_role": {
             "type": "string",
             "enum": ["system", "developer", "user"],
