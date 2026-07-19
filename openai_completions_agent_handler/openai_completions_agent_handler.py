@@ -459,6 +459,56 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             content.insert(0, {"type": "text", "text": text})
         return {"role": "user", "content": content}
 
+    @staticmethod
+    def _validate_tool_messages(messages: List[Dict[str, Any]]) -> None:
+        """
+        Defensive pre-flight: reject `role: "tool"` messages missing the
+        required `tool_call_id` field BEFORE sending to the provider.
+
+        Without this, a malformed message reaches the server and comes back as
+        a generic 400 `missing field \`tool_call_id\`` (e.g. Together.ai GLM:
+        `messages[N]: missing field \`tool_call_id\` at line 1 column 89231`)
+        with no indication of who emitted the bad message. Raising here with
+        the offending index and a content preview turns it into a loud,
+        debuggable client-side error so the upstream emitter can be found.
+
+        Also flags an orphan `tool` message whose preceding assistant message
+        does not carry `tool_calls` — strict providers reject that shape too.
+        """
+        if not messages:
+            return
+        # Map of tool_call ids present on assistant messages in the window.
+        parent_ids: set = set()
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        parent_ids.add(tc["id"])
+
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tc_id = msg.get("tool_call_id")
+            if not tc_id:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has role='tool' but is missing required "
+                    f"'tool_call_id'. This is usually caused by reconstructing "
+                    f"messages from _short_term_memory (where tool_call_id is "
+                    f"nested inside the content JSON) or from caller-supplied "
+                    f"history. Offending message: {preview}"
+                )
+            if tc_id not in parent_ids:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has tool_call_id='{tc_id}' but no preceding "
+                    f"assistant message carries that tool_call id. The parent "
+                    f"assistant message was likely trimmed away. Offending "
+                    f"message: {preview}"
+                )
+
     def invoke_model(self, **kwargs: Dict[str, Any]) -> Any:
         try:
             if self.enable_timeline_log:
@@ -480,6 +530,10 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         {"role": self.instructions_role, "content": instructions}
                     ] + messages
             payload["messages"] = messages
+
+            # Pre-flight: catch malformed `role: "tool"` messages before the
+            # provider rejects them with an opaque 400. See _validate_tool_messages.
+            self._validate_tool_messages(messages)
 
             if payload.get("stream"):
                 payload["stream_options"] = {"include_usage": True}
@@ -1208,6 +1262,29 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             error_msg = f"Function execution failed: {e}"
             return error_msg, Serializer.json_dumps(error_msg)
 
+    @staticmethod
+    def _coerce_tool_call_arguments(raw: str) -> Any:
+        """
+        Parse a tool_call's `arguments` JSON string into a dict when possible.
+
+        Some provider chat templates (notably Together.ai's GLM-5.2 Jinja
+        template) crash with `invalid operation: object is not callable`
+        when `tool_calls[].function.arguments` arrives as a JSON *string*
+        instead of a parsed object. The OpenAI Chat Completions spec allows
+        either, but GLM's template treats it as a dict and tries to call
+        into it. Parsing here is safe for spec-compliant servers too: they
+        re-serialize dicts back to strings on the wire.
+
+        If parsing fails, return the original string unchanged so we never
+        silently corrupt a value the model actually sent as a string.
+        """
+        if not isinstance(raw, str):
+            return raw
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+
     def _append_assistant_with_tool_calls(
         self,
         function_call_data_list: List[Dict[str, Any]],
@@ -1222,6 +1299,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         such as Groq's openai/gpt-oss-* family and OpenAI's official Chat
         Completions API. The reasoning trace is preserved separately in
         `self.final_output["reasoning_summary"]` for the caller.
+
+        `arguments` is parsed to a dict when it is valid JSON, as a workaround
+        for provider chat templates (GLM-5.2 on Together.ai) that reject string
+        arguments with `Failed to apply chat template: invalid operation:
+        object is not callable`. Spec-compliant servers re-serialize dicts
+        back to strings on the wire, so this is safe for everyone.
         """
         input_messages.append(
             {
@@ -1233,7 +1316,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         "type": "function",
                         "function": {
                             "name": fcd["name"],
-                            "arguments": fcd.get("arguments", "{}"),
+                            "arguments": self._coerce_tool_call_arguments(
+                                fcd.get("arguments", "{}")
+                            ),
                         },
                     }
                     for fcd in function_call_data_list
