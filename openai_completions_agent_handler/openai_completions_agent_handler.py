@@ -26,9 +26,7 @@ class ToolCallDepthExceeded(Exception):
     def __init__(self, depth: int, max_depth: int):
         self.depth = depth
         self.max_depth = max_depth
-        super().__init__(
-            f"Tool call round {depth} exceeds maximum {max_depth}"
-        )
+        super().__init__(f"Tool call round {depth} exceeds maximum {max_depth}")
 
 
 def _omit_none(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -186,6 +184,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "enable_thinking",
                     "separate_reasoning",
                     "enable_think_tag_split",
+                    "debug_log_request_messages",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -242,6 +241,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self._max_tool_call_depth = int(config.get("max_tool_call_depth", 8))
             self._enable_think_tag_split = bool(
                 config.get("enable_think_tag_split", False)
+            )
+            self._debug_log_request_messages = bool(
+                config.get("debug_log_request_messages", False)
             )
             self.output_format_type = self.model_setting.get("response_format", {}).get(
                 "type", "text"
@@ -459,6 +461,58 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             content.insert(0, {"type": "text", "text": text})
         return {"role": "user", "content": content}
 
+    @staticmethod
+    def _validate_tool_messages(messages: List[Dict[str, Any]]) -> None:
+        """
+        Defensive pre-flight: reject `role: "tool"` messages missing the
+        required `tool_call_id` field BEFORE sending to the provider.
+
+        Without this, a malformed message reaches the server and comes back as
+        a generic 400 `missing field 'tool_call_id'` (e.g. Together.ai GLM:
+        `messages[N]: missing field 'tool_call_id' at line 1 column 89231`)
+        with no indication of who emitted the bad message. Raising here with
+        the offending index and a content preview turns it into a loud,
+        debuggable client-side error so the upstream emitter can be found.
+
+        Also flags an orphan `tool` message whose preceding assistant message
+        does not carry `tool_calls` — strict providers reject that shape too.
+        """
+        if not messages:
+            return
+        # Map of tool_call ids present on assistant messages in the window.
+        parent_ids: set = set()
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and isinstance(
+                msg.get("tool_calls"), list
+            ):
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        parent_ids.add(tc["id"])
+
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tc_id = msg.get("tool_call_id")
+            if not tc_id:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has role='tool' but is missing required "
+                    f"'tool_call_id'. This is usually caused by reconstructing "
+                    f"messages from _short_term_memory (where tool_call_id is "
+                    f"nested inside the content JSON) or from caller-supplied "
+                    f"history. Offending message: {preview}"
+                )
+            if tc_id not in parent_ids:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has tool_call_id='{tc_id}' but no preceding "
+                    f"assistant message carries that tool_call id. The parent "
+                    f"assistant message was likely trimmed away. Offending "
+                    f"message: {preview}"
+                )
+
     def invoke_model(self, **kwargs: Dict[str, Any]) -> Any:
         try:
             if self.enable_timeline_log:
@@ -481,10 +535,44 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     ] + messages
             payload["messages"] = messages
 
+            # Pre-flight: catch malformed `role: "tool"` messages before the
+            # provider rejects them with an opaque 400. See _validate_tool_messages.
+            self._validate_tool_messages(messages)
+
+            # Ensure tool_calls[].function.arguments is a JSON string per the
+            # OpenAI Chat Completions spec.  Together.ai's deserializer rejects
+            # dict/object values with a 400; their GLM-5.2 Jinja2 template also
+            # calls .items() on the value and fails on a string.  This is a
+            # Together.ai server bug — their template should json.loads the
+            # string before traversal.  We send the spec-compliant string form;
+            # providers that follow the spec (OpenAI, vLLM, SGLang) accept it.
+            for msg in messages:
+                if msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        func = tc.get("function")
+                        if func and not isinstance(func.get("arguments"), str):
+                            func["arguments"] = json.dumps(
+                                func["arguments"], ensure_ascii=False
+                            )
+
             if payload.get("stream"):
                 payload["stream_options"] = {"include_usage": True}
             else:
                 payload.pop("stream_options", None)
+
+            if (
+                self._debug_log_request_messages
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                try:
+                    dumped = json.dumps(payload.get("messages", []), default=str)
+                except Exception:
+                    dumped = repr(payload.get("messages", []))
+                self.logger.info(
+                    f"[REQUEST_MESSAGES] count={len(payload.get('messages', []))} "
+                    f"payload={_truncate(dumped, 8000)}"
+                )
 
             result = self.client.chat.completions.create(**_omit_none(payload))
 
@@ -977,9 +1065,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 return function.get("parameters")
         return None
 
-    def _coerce_arguments_to_schema(
-        self, name: str, arguments: Any
-    ) -> Any:
+    def _coerce_arguments_to_schema(self, name: str, arguments: Any) -> Any:
         """Apply schema-driven coercion to LLM-emitted arguments."""
         schema = self._get_tool_parameters_schema(name)
         if not isinstance(schema, dict):
@@ -990,7 +1076,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 )
             return arguments
         coerced = self._coerce_to_schema(arguments, schema)
-        if coerced != arguments and self.logger and self.logger.isEnabledFor(logging.INFO):
+        if (
+            coerced != arguments
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
             self.logger.info(
                 f"[SCHEMA_COERCE] tool={name!r} coerced "
                 f"before={_truncate(Serializer.json_dumps(arguments))} "
@@ -1098,8 +1188,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             }
         if isinstance(obj, list):
             return [
-                OpenAICompletionsEventHandler._unwrap_stringified_json(v)
-                for v in obj
+                OpenAICompletionsEventHandler._unwrap_stringified_json(v) for v in obj
             ]
         if isinstance(obj, str):
             stripped = obj.strip()
@@ -1115,6 +1204,43 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 except (json.JSONDecodeError, ValueError):
                     return obj
         return obj
+
+    @staticmethod
+    def _normalize_tool_output_for_llm(output: Any) -> Any:
+        """
+        Convert MCP text-content tool results into the payload the model should see.
+
+        MCP HTTP tool calls commonly return a content-part list such as
+        [{"type": "text", "text": "{\"request_uuid\":\"...\"}"}]. Sending
+        that nested wrapper back as the Chat Completions tool result makes the
+        model see MCP transport metadata instead of the actual tool output.
+        """
+        if not isinstance(output, list) or not output:
+            return output
+
+        text_parts: List[str] = []
+        for item in output:
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                return output
+            text_parts.append(item["text"])
+
+        if len(text_parts) != 1:
+            return "\n".join(text_parts)
+
+        text = text_parts[0]
+        stripped = text.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        ):
+            try:
+                return json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return text
 
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]
@@ -1156,6 +1282,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             function_output = agent_function(**arguments)
             exec_ms = (pendulum.now("UTC") - exec_start).total_seconds() * 1000
 
+            function_output = self._normalize_tool_output_for_llm(function_output)
             serialized_output = Serializer.json_dumps(function_output)
 
             if self.logger and self.logger.isEnabledFor(logging.INFO):
@@ -1208,6 +1335,29 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             error_msg = f"Function execution failed: {e}"
             return error_msg, Serializer.json_dumps(error_msg)
 
+    @staticmethod
+    def _coerce_tool_call_arguments(raw: str) -> str:
+        """
+        Ensure tool_call arguments is a valid JSON string per the OpenAI
+        Chat Completions spec.
+
+        The spec requires `arguments` to be a JSON-encoded string.  Some
+        providers (Together.ai, vLLM) reject dict/object values with a 400
+        error.  This method validates the string is parseable JSON and
+        returns it as-is.
+
+        Note: GLM-5.2's Jinja2 template calls .items() on the value and fails
+        on a string — that is a Together.ai server bug (they should json.loads
+        the string before template traversal).  We stay spec-compliant here.
+        """
+        if not isinstance(raw, str):
+            return raw
+        try:
+            json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return raw
+
     def _append_assistant_with_tool_calls(
         self,
         function_call_data_list: List[Dict[str, Any]],
@@ -1222,6 +1372,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         such as Groq's openai/gpt-oss-* family and OpenAI's official Chat
         Completions API. The reasoning trace is preserved separately in
         `self.final_output["reasoning_summary"]` for the caller.
+
+        `arguments` is kept as a JSON string per the OpenAI Chat Completions
+        spec.  Provider deserializers (Together.ai, vLLM) reject dict/object
+        values with a 400 error.  GLM-5.2's Jinja2 template calls .items() on
+        the value and fails on a string — that is a Together.ai server bug.
+        invoke_model() also stringifies any dict arguments before the API call.
         """
         input_messages.append(
             {
@@ -1233,7 +1389,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         "type": "function",
                         "function": {
                             "name": fcd["name"],
-                            "arguments": fcd.get("arguments", "{}"),
+                            "arguments": self._coerce_tool_call_arguments(
+                                fcd.get("arguments", "{}")
+                            ),
                         },
                     }
                     for fcd in function_call_data_list
@@ -1306,7 +1464,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 ],
                 input_messages,
             )
-            self._next_input_messages = self._trim_messages_for_recursion(input_messages)
+            self._next_input_messages = self._trim_messages_for_recursion(
+                input_messages
+            )
             self._tool_loop_continue = True
             return response.id
 

@@ -40,6 +40,8 @@ The core handler is substantially implemented. A deterministic unit suite and tw
 - API-key redaction through `_redact_api_key()`.
 - SDK exception propagation: `invoke_model()` and `ask_model()` re-raise `openai.APIError` subclasses and `ToolCallDepthExceeded` without wrapping.
 - Minimal image content-array helpers: `_validate_image_url()` and `_build_image_message()`.
+- `_coerce_tool_call_arguments()` validates that `arguments` is parseable JSON but keeps it as a **string** per the OpenAI Chat Completions spec. Converting to a dict causes 400 errors from Together.ai (`Invalid JSON data: invalid type: map, expected a string`) and vLLM.
+- `ask_model()` uses a `while True` tool loop (`_tool_loop_continue` flag) instead of recursive calls. Depth-exceeded errors return an error output via `_finalize_terminal_error_output()` rather than raising `ToolCallDepthExceeded`.
 
 ### Known Gaps Before v1
 
@@ -49,6 +51,7 @@ The core handler is substantially implemented. A deterministic unit suite and tw
 - **Interactive smoke tests rely on env-driven config.** `.env.example` documents the local-provider defaults, but Gemma's required `instructions_role="user"` is easy to miss.
 - **Dependency install path is fragile.** `pyproject.toml` depends on `AI-Agent-Handler` and `SilvaEngine-Utility`, while the README Quick Start mentions `AI-Agent-Handler` and `ai_agent_core_engine`. The docs should identify the complete dependency source of truth.
 - **Packaging includes broad package discovery.** `tool.setuptools.packages.find.include = ["*"]` can accidentally include generated or unrelated package directories.
+- **Together.ai GLM-5.2 tool-call incompatibility.** Together.ai's server has conflicting requirements: their JSON deserializer rejects `tool_calls[].function.arguments` sent as a dict (`invalid type: map, expected a string`), but their GLM-5.2 Jinja2 chat template calls `.items()` on the value and fails on a string (`object is not callable`). The handler sends the spec-compliant string form; the fix must come from Together.ai (they should `json.loads` the string before template traversal). Workaround: use vLLM or SGLang to self-host GLM-5.2 with a patched template, or use a different model on Together.ai.
 
 ## 3. v1 Scope
 
@@ -110,6 +113,7 @@ Payload hygiene is part of the contract:
 - Image helper URLs are limited to `http`, `https`, and `data` schemes; no local file paths are read by the handler.
 - Provider-specific parameters belong in `extra_body`.
 - Tool-call continuation must preserve the assistant tool-call message and all matching tool result messages as a complete group.
+- `tool_calls[].function.arguments` must remain a JSON **string** — converting it to a dict causes 400 errors from Together.ai, vLLM, and other strict deserializers.
 
 ## 5. Configuration Design
 
@@ -333,6 +337,7 @@ Before tagging v1:
 - README distinguishes package-user setup from maintainer-local validation with the ignored test bundle.
 - Deterministic tests pass in the maintainer-local checkout.
 - SDK exception types propagate unchanged from both `invoke_model()` and `ask_model()`.
+- `tool_calls[].function.arguments` is always a JSON string (never a dict) in the on-wire payload.
 - The package installs from a clean checkout using the documented dependency flow.
 - No `__pycache__`, test cache, egg metadata, or build artifacts are included in release artifacts.
 - `configuration_schema.json` matches implemented behavior.
