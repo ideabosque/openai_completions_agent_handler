@@ -186,6 +186,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "enable_thinking",
                     "separate_reasoning",
                     "enable_think_tag_split",
+                    "debug_log_request_messages",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -242,6 +243,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self._max_tool_call_depth = int(config.get("max_tool_call_depth", 8))
             self._enable_think_tag_split = bool(
                 config.get("enable_think_tag_split", False)
+            )
+            self._debug_log_request_messages = bool(
+                config.get("debug_log_request_messages", False)
             )
             self.output_format_type = self.model_setting.get("response_format", {}).get(
                 "type", "text"
@@ -539,6 +543,21 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                 payload["stream_options"] = {"include_usage": True}
             else:
                 payload.pop("stream_options", None)
+
+            if (
+                # self._debug_log_request_messages
+                # and 
+                self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                try:
+                    dumped = json.dumps(payload.get("messages", []), default=str)
+                except Exception:
+                    dumped = repr(payload.get("messages", []))
+                self.logger.info(
+                    f"[REQUEST_MESSAGES] count={len(payload.get('messages', []))} "
+                    f"payload={_truncate(dumped, 8000)}"
+                )
 
             result = self.client.chat.completions.create(**_omit_none(payload))
 
