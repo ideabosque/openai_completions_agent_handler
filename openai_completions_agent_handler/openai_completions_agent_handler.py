@@ -185,6 +185,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "separate_reasoning",
                     "enable_think_tag_split",
                     "debug_log_request_messages",
+                    "tool_history_compatibility",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -245,6 +246,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self._debug_log_request_messages = bool(
                 config.get("debug_log_request_messages", False)
             )
+            self._tool_history_compatibility = str(
+                config.get("tool_history_compatibility", "auto")
+            ).lower()
             self.output_format_type = self.model_setting.get("response_format", {}).get(
                 "type", "text"
             )
@@ -461,6 +465,80 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             content.insert(0, {"type": "text", "text": text})
         return {"role": "user", "content": content}
 
+    def _needs_plain_tool_history(self) -> bool:
+        """Return true when a provider cannot render strict tool history."""
+        mode = self._tool_history_compatibility
+        if mode in {"strict", "off", "false"}:
+            return False
+        if mode in {"flatten", "plain", "compat"}:
+            return True
+
+        base_url = str(self.agent.get("configuration", {}).get("base_url") or "")
+        model = str(self.model_setting.get("model") or "")
+        return "together.ai" in base_url.lower() and "glm" in model.lower()
+
+    @staticmethod
+    def _render_tool_history_as_text(
+        messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert strict tool protocol messages into plain transcript messages.
+
+        This is only for provider templates that reject standard
+        assistant.tool_calls + role:tool history on the next request. It keeps
+        the tool name, id, arguments, and result visible to the model.
+        """
+        rendered: List[Dict[str, Any]] = []
+        tool_names_by_id: Dict[str, str] = {}
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                rendered.append(msg)
+                continue
+
+            role = msg.get("role")
+            tool_calls = msg.get("tool_calls")
+            if role == "assistant" and isinstance(tool_calls, list):
+                if msg.get("content"):
+                    rendered.append({"role": "assistant", "content": msg["content"]})
+
+                lines = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = str(tc.get("id") or "unknown")
+                    function = tc.get("function") or {}
+                    name = str(function.get("name") or "unknown_tool")
+                    arguments = function.get("arguments", "{}")
+                    tool_names_by_id[tc_id] = name
+                    lines.append(f"- {name} id={tc_id} arguments={arguments}")
+                if lines:
+                    rendered.append(
+                        {
+                            "role": "assistant",
+                            "content": "Tool call executed:\n" + "\n".join(lines),
+                        }
+                    )
+                continue
+
+            if role == "tool":
+                tc_id = str(msg.get("tool_call_id") or "unknown")
+                name = tool_names_by_id.get(tc_id, "unknown_tool")
+                rendered.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Tool result from {name} id={tc_id}:\n"
+                            f"{msg.get('content', '')}"
+                        ),
+                    }
+                )
+                continue
+
+            rendered.append(msg)
+
+        return rendered
+
     @staticmethod
     def _validate_tool_messages(messages: List[Dict[str, Any]]) -> None:
         """
@@ -554,6 +632,19 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                             func["arguments"] = json.dumps(
                                 func["arguments"], ensure_ascii=False
                             )
+
+            if self._needs_plain_tool_history():
+                rendered_messages = self._render_tool_history_as_text(messages)
+                if rendered_messages != messages:
+                    messages = rendered_messages
+                    payload["messages"] = messages
+                    payload.pop("tool_choice", None)
+                    payload.pop("parallel_tool_calls", None)
+                    if self.logger and self.logger.isEnabledFor(logging.INFO):
+                        self.logger.info(
+                            "[TOOL_HISTORY_COMPAT] rendered strict tool history "
+                            "as plain text for provider compatibility"
+                        )
 
             if payload.get("stream"):
                 payload["stream_options"] = {"include_usage": True}
@@ -1167,19 +1258,31 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         return value
 
     @staticmethod
+    def _parse_json_container_text(value: Any) -> Any:
+        """Parse JSON object/array strings; return every other value unchanged."""
+        if not isinstance(value, str):
+            return value
+
+        stripped = value.strip()
+        is_container = (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        )
+        if not is_container:
+            return value
+
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return value
+
+    @staticmethod
     def _unwrap_stringified_json(obj: Any) -> Any:
         """
-        Some LLMs (notably smaller/instruction-tuned Ollama / GPT-OSS models)
-        double-encode array or object parameters: they emit a JSON *string*
-        containing a JSON array/object where the tool schema expects the raw
-        array/object. The MCP layer then rejects the argument with
+        Recursively unwrap JSON object/array strings inside tool arguments.
 
-            'includeDomains: expected array, received string'
-
-        This walks the parsed arguments and json.loads any string whose
-        stripped content starts with `[`/`{` and ends with `]`/`}`. Non-JSON
-        strings, strings that happen to start with `[` but fail json.loads,
-        and non-string primitives are passed through unchanged.
+        Some local or instruction-tuned models double-encode structured values,
+        for example emitting a string that contains a JSON array where the MCP
+        tool schema expects the array itself. Ordinary strings are preserved.
         """
         if isinstance(obj, dict):
             return {
@@ -1190,30 +1293,20 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             return [
                 OpenAICompletionsEventHandler._unwrap_stringified_json(v) for v in obj
             ]
-        if isinstance(obj, str):
-            stripped = obj.strip()
-            if (stripped.startswith("[") and stripped.endswith("]")) or (
-                stripped.startswith("{") and stripped.endswith("}")
-            ):
-                try:
-                    parsed = json.loads(stripped)
-                    # Recurse in case of triple-encoding (rare but observed).
-                    return OpenAICompletionsEventHandler._unwrap_stringified_json(
-                        parsed
-                    )
-                except (json.JSONDecodeError, ValueError):
-                    return obj
+
+        parsed = OpenAICompletionsEventHandler._parse_json_container_text(obj)
+        if parsed is not obj:
+            return OpenAICompletionsEventHandler._unwrap_stringified_json(parsed)
         return obj
 
     @staticmethod
     def _normalize_tool_output_for_llm(output: Any) -> Any:
         """
-        Convert MCP text-content tool results into the payload the model should see.
+        Strip MCP transport wrappers before writing Chat Completions tool output.
 
-        MCP HTTP tool calls commonly return a content-part list such as
-        [{"type": "text", "text": "{\"request_uuid\":\"...\"}"}]. Sending
-        that nested wrapper back as the Chat Completions tool result makes the
-        model see MCP transport metadata instead of the actual tool output.
+        MCP HTTP tools often return text content parts like
+        ``[{"type": "text", "text": "{...}"}]``. The follow-up model request
+        should contain the inner tool result, not the MCP content envelope.
         """
         if not isinstance(output, list) or not output:
             return output
@@ -1231,16 +1324,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         if len(text_parts) != 1:
             return "\n".join(text_parts)
 
-        text = text_parts[0]
-        stripped = text.strip()
-        if (stripped.startswith("{") and stripped.endswith("}")) or (
-            stripped.startswith("[") and stripped.endswith("]")
-        ):
-            try:
-                return json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
-                pass
-        return text
+        return OpenAICompletionsEventHandler._parse_json_container_text(text_parts[0])
 
     def _execute_function(
         self, function_call_data: Dict[str, Any], arguments: Dict[str, Any]

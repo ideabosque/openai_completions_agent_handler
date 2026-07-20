@@ -151,7 +151,12 @@
             "default": false,
             "description": "When true, log a truncated JSON dump of the `messages` array (up to 8000 chars) before every chat.completions.create() call, tagged [REQUEST_MESSAGES]. Diagnostic only — use to inspect on-wire message shape when a provider rejects the request. Off by default; noisy in production."
         },
-        "instructions_role": {
+        "tool_history_compatibility": {
+            "type": "string",
+            "enum": ["auto", "strict", "flatten"],
+            "default": "auto",
+            "description": "Controls follow-up requests after tool execution. 'strict' preserves standard Chat Completions assistant.tool_calls plus role:tool messages. 'flatten' renders prior tool calls/results as plain text for provider templates that reject strict tool history. 'auto' enables flattening only for known incompatible providers such as Together.ai GLM."
+        },        "instructions_role": {
             "type": "string",
             "enum": ["system", "developer", "user"],
             "default": "system",
