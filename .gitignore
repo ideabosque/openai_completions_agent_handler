@@ -140,7 +140,12 @@ cython_debug/
 .pypirc
 
 .vscode/
-tests/
+# Ignore prompt files (*.md) inside any `tests/` directory at any depth.
+# `**/tests/*.md` (not `tests/*.md`) is required because a pattern with a
+# middle slash is rooted to the .gitignore location, so `tests/*.md` alone
+# would only match `<repo-root>/tests/*.md`, missing the actual location at
+# `openai_completions_agent_handler/tests/*.md`.
+**/tests/*.md
 .zed
 .claude/
 AGENTS.md
