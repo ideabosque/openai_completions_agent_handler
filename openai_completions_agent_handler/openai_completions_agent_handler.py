@@ -539,91 +539,6 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
 
         return rendered
 
-    def _repair_tool_messages(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Repair the 'hybrid' tool-message shape that appears when caller code
-        reconstructs history from _short_term_memory (or an external store
-        shaped the same way) and forgets to hoist tool_call_id to the top
-        level.
-
-        Broken shape (as seen in production logs):
-            {
-              "role": "tool",
-              "content": "{\\"tool\\": {\\"tool_call_id\\": \\"call_xxx\\", ...},
-                          \\"output\\": \\"...\\"}"
-            }
-
-        Repaired shape (spec-compliant):
-            {
-              "role": "tool",
-              "tool_call_id": "call_xxx",
-              "content": "<the output field as a string>"
-            }
-
-        Only messages that match the exact broken pattern are rewritten:
-          - role == "tool"
-          - no top-level tool_call_id
-          - content is a JSON string that parses to {"tool": {"tool_call_id":
-            "..."}, "output": ...}
-
-        Everything else is passed through unchanged; a single WARNING log
-        surfaces so the upstream emitter can be fixed at the source.
-        """
-        repaired: List[Dict[str, Any]] = []
-        repair_count = 0
-        for msg in messages:
-            if (
-                not isinstance(msg, dict)
-                or msg.get("role") != "tool"
-                or msg.get("tool_call_id")
-            ):
-                repaired.append(msg)
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str):
-                repaired.append(msg)
-                continue
-            try:
-                parsed = json.loads(content)
-            except (json.JSONDecodeError, ValueError):
-                repaired.append(msg)
-                continue
-            if not isinstance(parsed, dict):
-                repaired.append(msg)
-                continue
-            tool_meta = parsed.get("tool")
-            if not isinstance(tool_meta, dict):
-                repaired.append(msg)
-                continue
-            tc_id = tool_meta.get("tool_call_id")
-            if not tc_id:
-                repaired.append(msg)
-                continue
-            output = parsed.get("output")
-            if isinstance(output, str):
-                new_content = output
-            else:
-                new_content = json.dumps(output, default=str)
-            repaired.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": new_content,
-                }
-            )
-            repair_count += 1
-
-        if repair_count and self.logger and self.logger.isEnabledFor(logging.WARNING):
-            self.logger.warning(
-                f"[TOOL_MSG_REPAIR] Hoisted tool_call_id out of nested content "
-                f"for {repair_count} message(s). Upstream code should build tool "
-                f"messages as {{'role':'tool','tool_call_id':X,'content':Y}} "
-                f"directly instead of the _short_term_memory hybrid shape."
-            )
-        return repaired
-
     @staticmethod
     def _validate_tool_messages(messages: List[Dict[str, Any]]) -> None:
         """
@@ -696,10 +611,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     messages = [
                         {"role": self.instructions_role, "content": instructions}
                     ] + messages
-            # Repair the specific known-broken tool-message shape (nested
-            # tool_call_id inside content) BEFORE validation. See docstring
-            # of _repair_tool_messages for the pattern this rescues.
-            messages = self._repair_tool_messages(messages)
+
             payload["messages"] = messages
 
             # Pre-flight: catch any remaining malformed `role: "tool"` messages
