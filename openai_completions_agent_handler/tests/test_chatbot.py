@@ -100,7 +100,7 @@ llm_agent = {
         "model": os.getenv("model"),
         "openai_api_key": os.getenv("openai_api_key"),
         "temperature": "0.7",
-        "max_tokens": "1024",
+        "max_completion_tokens": os.getenv("max_completion_tokens", os.getenv("max_tokens", "8192")),
         "instructions_role": os.getenv("instructions_role", "system"),
         "max_tool_call_depth": 8,
         "request_timeout_seconds": 120.0,

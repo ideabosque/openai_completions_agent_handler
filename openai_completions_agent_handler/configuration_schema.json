@@ -67,7 +67,8 @@
         "max_completion_tokens": {
             "type": "integer",
             "minimum": 1,
-            "description": "Hard cap on completion tokens. Preferred over max_tokens for newer OpenAI models. If both are set, this takes precedence."
+            "default": 8192,
+            "description": "Hard cap on completion tokens. Preferred over max_tokens for newer OpenAI models. If both are set, this takes precedence. Reasoning-heavy models should set this well above 1024 to avoid truncation before visible final content."
         },
         "temperature": {
             "type": "number",

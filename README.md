@@ -157,7 +157,7 @@ Notes on the configuration:
     "base_url": "http://127.0.0.1:30000/v1",
     "openai_api_key": "EMPTY",
     "temperature": 0.7,
-    "max_tokens": 1024,
+    "max_completion_tokens": 8192,
     "extra_body": {
       "chat_template_kwargs": {"enable_thinking": true},
       "separate_reasoning": true
@@ -180,7 +180,7 @@ Amazon Bedrock exposes supported GLM models through its OpenAI-compatible Chat C
     "model": "zai.glm-5",
     "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
     "openai_api_key": "${BEDROCK_API_KEY}",
-    "max_tokens": 4096,
+    "max_completion_tokens": 8192,
     "reasoning_effort": "high"
   }
 }
