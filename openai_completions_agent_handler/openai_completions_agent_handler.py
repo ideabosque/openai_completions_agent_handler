@@ -286,6 +286,17 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         return bool(text and text.strip())
 
     @staticmethod
+    def _empty_visible_content_message(finish_reason: Optional[str]) -> str:
+        if finish_reason == "length":
+            return (
+                "The model response was truncated before producing visible content. "
+                "Increase max_completion_tokens or shorten the prompt/context, then retry."
+            )
+        if finish_reason == "content_filter":
+            return "The model response was filtered before producing visible content."
+        return "The model returned reasoning but no visible content."
+
+    @staticmethod
     def _get_reasoning_content(part: Any) -> Optional[str]:
         for field_name in ("reasoning_content", "reasoning", "thinking"):
             value = getattr(part, field_name, None)
@@ -1574,6 +1585,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             )
             return response.id
 
+        if not self._has_valid_content(content):
+            content = self._empty_visible_content_message(finish_reason)
+
         self.final_output.update(
             {
                 "message_id": response.id,
@@ -1944,6 +1958,8 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             )
 
         final_accumulated_text = "".join(accumulated_text_parts)
+        if not self._has_valid_content(final_accumulated_text):
+            final_accumulated_text = self._empty_visible_content_message(finish_reason)
 
         if (
             self.enable_timeline_log

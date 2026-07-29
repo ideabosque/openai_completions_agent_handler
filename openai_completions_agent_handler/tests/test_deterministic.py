@@ -242,6 +242,30 @@ class TestNonStreamingResponse(unittest.TestCase):
         handler.handle_response(mock_response, [{"role": "user", "content": "Hi"}])
         self.assertTrue(handler.final_output.get("truncated"))
 
+
+    @patch("openai_completions_agent_handler.openai_completions_agent_handler.openai.OpenAI")
+    def test_14b_finish_reason_length_with_reasoning_only_uses_visible_fallback(self, mock_openai):
+        logger, agent, setting = _make_handler()
+        handler = OpenAICompletionsEventHandler(logger, agent, **setting)
+        handler.client = MagicMock()
+        msg = MagicMock()
+        msg.content = ""
+        msg.tool_calls = None
+        msg.role = "assistant"
+        msg.reasoning_content = "thinking without final text"
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message = msg
+        mock_response.choices[0].finish_reason = "length"
+        mock_response.id = "resp_4b"
+        mock_response.usage = None
+        handler.handle_response(mock_response, [{"role": "user", "content": "Hi"}])
+        self.assertTrue(handler.final_output.get("truncated"))
+        self.assertEqual(
+            handler.final_output["reasoning_summary"], "thinking without final text"
+        )
+        self.assertIn("truncated", handler.final_output["content"])
+
     @patch("openai_completions_agent_handler.openai_completions_agent_handler.openai.OpenAI")
     def test_15_finish_reason_content_filter_marks_filtered(self, mock_openai):
         logger, agent, setting = _make_handler()
@@ -368,6 +392,30 @@ class TestStreaming(unittest.TestCase):
 
         handler.handle_stream([chunk], [{"role": "user", "content": "Hi"}])
         self.assertTrue(handler.final_output.get("truncated"))
+
+
+
+    @patch("openai_completions_agent_handler.openai_completions_agent_handler.openai.OpenAI")
+    def test_19b_stream_finish_length_with_reasoning_only_uses_visible_fallback(self, mock_openai):
+        logger, agent, setting = _make_handler()
+        handler = OpenAICompletionsEventHandler(logger, agent, **setting)
+
+        chunk = MagicMock()
+        chunk.id = "s_4b"
+        chunk.choices = [MagicMock()]
+        delta = MagicMock()
+        delta.content = None
+        delta.tool_calls = None
+        delta.reasoning_content = "thinking without final text"
+        chunk.choices[0].delta = delta
+        chunk.choices[0].finish_reason = "length"
+
+        handler.handle_stream([chunk], [{"role": "user", "content": "Hi"}])
+        self.assertTrue(handler.final_output.get("truncated"))
+        self.assertEqual(
+            handler.final_output["reasoning_summary"], "thinking without final text"
+        )
+        self.assertIn("truncated", handler.final_output["content"])
 
 
 class TestConversationHistory(unittest.TestCase):
