@@ -477,7 +477,21 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         return {"role": "user", "content": content}
 
     def _needs_plain_tool_history(self) -> bool:
-        """Return true when a provider cannot render strict tool history."""
+        """
+        Return true when a provider cannot render strict tool history.
+
+        Auto-detects Together.ai chat templates known to fail on the
+        spec-compliant assistant.tool_calls + role:tool shape. Symptom is a
+        400 with `Failed to render template: invalid operation: object is
+        not callable (in chat:N)`. Observed on Together.ai's GLM-5.x and
+        MiniMax-M3 templates; likely applies to any Together.ai model whose
+        template does not properly guard tool-history rendering.
+
+        Callers can force either behavior via `tool_history_compatibility`:
+            "flatten" | "plain" | "compat"  -> always render as text transcript
+            "strict"  | "off"   | "false"   -> never render as text
+            unset                            -> auto-detect (default)
+        """
         mode = self._tool_history_compatibility
         if mode in {"strict", "off", "false"}:
             return False
@@ -485,8 +499,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             return True
 
         base_url = str(self.agent.get("configuration", {}).get("base_url") or "")
-        model = str(self.model_setting.get("model") or "")
-        return "together.ai" in base_url.lower() and "glm" in model.lower()
+        model = str(self.model_setting.get("model") or "").lower()
+        if "together.ai" not in base_url.lower():
+            return False
+        # Known-broken Together.ai templates. Extend this list as new models
+        # exhibit the same "object is not callable" failure.
+        broken_model_markers = ("glm", "minimax")
+        return any(marker in model for marker in broken_model_markers)
 
     @staticmethod
     def _render_tool_history_as_text(
