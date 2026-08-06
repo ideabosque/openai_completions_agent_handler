@@ -157,8 +157,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     key=lambda t: t.get("function", {}).get("name", "")
                 )
 
-            if "enabled_tools" in config:
-                enabled_set = set(config["enabled_tools"])
+            # Only apply enabled_tools filter when a non-empty allowlist is
+            # provided. An empty list means "no filter, keep all tools" — not
+            # "filter everything out" (which was the previous behavior).
+            enabled_tools = config.get("enabled_tools")
+            if enabled_tools:
+                enabled_set = set(enabled_tools)
                 if "tools" in config:
                     config["tools"] = [
                         tool
@@ -201,6 +205,43 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     v = float(v)
                 elif isinstance(v, Decimal):
                     v = float(v)
+                elif k in {
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "logit_bias",
+                }:
+                    # Some upstream serializers emit `[]` for empty dict-typed
+                    # fields (or the field arrives as an unexpected list). The
+                    # OpenAI SDK does `**value` on these — a list crashes with
+                    # `TypeError: 'list' object is not a mapping`. Skip the
+                    # field entirely so downstream code sees "unset", not
+                    # None (which would still trip .get(...).get(...) chains).
+                    if isinstance(v, list):
+                        if v and self.logger and self.logger.isEnabledFor(
+                            logging.WARNING
+                        ):
+                            self.logger.warning(
+                                f"Config field {k!r} arrived as a non-empty list; "
+                                f"expected dict/object. Dropping it. Value: "
+                                f"{_truncate(str(v))}"
+                            )
+                        continue
+                elif k == "response_format":
+                    # A malformed `response_format` (e.g. json_schema.schema
+                    # arriving as `[]`) causes providers to reject the request.
+                    # Skip it entirely rather than storing None.
+                    if isinstance(v, dict):
+                        js = v.get("json_schema")
+                        if isinstance(js, dict) and isinstance(js.get("schema"), list):
+                            if self.logger and self.logger.isEnabledFor(
+                                logging.WARNING
+                            ):
+                                self.logger.warning(
+                                    "response_format.json_schema.schema is a list; "
+                                    "expected object. Dropping response_format."
+                                )
+                            continue
                 self.model_setting[k] = v
 
             if (
@@ -249,9 +290,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self._tool_history_compatibility = str(
                 config.get("tool_history_compatibility", "auto")
             ).lower()
-            self.output_format_type = self.model_setting.get("response_format", {}).get(
-                "type", "text"
-            )
+            # `or {}` handles the case where response_format is stored as
+             # None (see the sanitization branch above that drops a malformed
+             # schema by setting the value to None so _omit_none strips it
+             # from the payload later).
+            self.output_format_type = (
+                self.model_setting.get("response_format") or {}
+            ).get("type", "text")
             self.enable_timeline_log = setting.get("enable_timeline_log", False)
             self._tools_cache_valid = False
 
