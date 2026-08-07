@@ -147,6 +147,11 @@
             "default": false,
             "description": "When true, the streaming handler scans content for inline <think>...</think> blocks and routes them to the reasoning channel. Enable only for servers that fail to populate delta.reasoning_content and emit raw <think> tags instead (e.g. vLLM with GLM-5 hitting parser bug #29763, DeepSeek/Qwen3 without a reasoning parser flag). Off by default."
         },
+        "reasoning_mask_char": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Optional single-character mask for reasoning content streamed to stdout, the WebSocket, and stored in final_output.reasoning_summary. When set to a non-empty single character (e.g. `*`, `·`, ` `), every non-whitespace reasoning char is replaced with it (length preserved so the client sees that reasoning is in progress without exposing the text). Leave null or blank to stream reasoning as-is (default)."
+        },
         "debug_log_request_messages": {
             "type": "boolean",
             "default": false,
