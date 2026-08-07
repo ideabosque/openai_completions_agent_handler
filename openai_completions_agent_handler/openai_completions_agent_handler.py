@@ -190,6 +190,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     "enable_think_tag_split",
                     "debug_log_request_messages",
                     "tool_history_compatibility",
+                    "reasoning_mask_char",
                 ]:
                     continue
                 if k == "max_tokens":
@@ -290,6 +291,13 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self._tool_history_compatibility = str(
                 config.get("tool_history_compatibility", "auto")
             ).lower()
+            # Masking is enabled iff reasoning_mask_char is a non-empty string.
+            # Take the first char to guarantee single-char replacement even
+            # when someone hands in a multi-char string.
+            raw_mask = config.get("reasoning_mask_char")
+            self._reasoning_mask_char = (
+                str(raw_mask)[:1] if raw_mask else ""
+            )
             # `or {}` handles the case where response_format is stored as
              # None (see the sanitization branch above that drops a malformed
              # schema by setting the value to None so _omit_none strips it
@@ -340,6 +348,16 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         if finish_reason == "content_filter":
             return "The model response was filtered before producing visible content."
         return "The model returned reasoning but no visible content."
+
+    def _apply_reasoning_mask(self, text: str) -> str:
+        """Replace every non-whitespace reasoning char with the configured
+        mask char when `reasoning_mask_char` is set. When the config is
+        blank/None, reasoning streams through as-is. Whitespace passes
+        through so line breaks/spaces still shape the visible output."""
+        if not self._reasoning_mask_char or not text:
+            return text
+        ch = self._reasoning_mask_char
+        return "".join(ch if c and not c.isspace() else c for c in text)
 
     @staticmethod
     def _get_reasoning_content(part: Any) -> Optional[str]:
@@ -1608,7 +1626,9 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
         )
 
         if reasoning_content:
-            self.final_output["reasoning_summary"] = reasoning_content
+            self.final_output["reasoning_summary"] = self._apply_reasoning_mask(
+                reasoning_content
+            )
 
         if tool_calls:
             input_messages = self.handle_function_calls(
@@ -1748,6 +1768,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     content_part, think_part = delta.content, ""
                 if think_part:
                     reasoning_active = True
+                    think_part = self._apply_reasoning_mask(think_part)
                     print(think_part, end="", flush=True)
                     accumulated_reasoning_parts.append(think_part)
                     accumulated_partial_reasoning_parts.append(think_part)
@@ -1824,6 +1845,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             if reasoning_content:
                 received_any_content = True
                 reasoning_active = True
+                reasoning_content = self._apply_reasoning_mask(reasoning_content)
                 print(reasoning_content, end="", flush=True)
                 accumulated_reasoning_parts.append(reasoning_content)
                 accumulated_partial_reasoning_parts.append(reasoning_content)
@@ -1948,6 +1970,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             tail_content, tail_think = "", ""
         if tail_think:
             reasoning_active = True
+            tail_think = self._apply_reasoning_mask(tail_think)
             print(tail_think, end="", flush=True)
             accumulated_reasoning_parts.append(tail_think)
             accumulated_partial_reasoning_parts.append(tail_think)
