@@ -944,6 +944,12 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             self.final_output = {}
             self.uploaded_files = []
             self._short_term_memory = []
+            # Track whether ANY handle_stream in this conversation has already
+            # sent a `content_part.added` signal to the wire. Multiple tool
+            # rounds emit multiple handle_stream invocations but should collapse
+            # into a single logical message from the WebSocket consumer's view:
+            # message_end fires exactly once, at the terminal round.
+            self._conversation_content_started = False
 
         if self._ask_model_depth > self._max_tool_call_depth:
             attempted_depth = self._ask_model_depth
@@ -1803,6 +1809,7 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                     # Signal start of content message on the first content delta.
                     if not content_message_started:
                         content_message_started = True
+                        self._conversation_content_started = True
                         if index == 0 and reasoning_index > 0:
                             index = reasoning_index + 1
                         self.send_data_to_stream(
@@ -1904,13 +1911,11 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
                         )
                         accumulated_partial_text_parts = []
                         index += 1
-                    if content_message_started:
-                        self.send_data_to_stream(
-                            index=index,
-                            data_format=output_format,
-                            is_message_end=True,
-                        )
-                        content_message_started = False
+                    # NOTE: intentionally NOT sending is_message_end here.
+                    # Multiple tool-call rounds collapse into ONE logical
+                    # WebSocket message; message_end fires exactly once in the
+                    # terminal post-loop cleanup. Partial flushes above still
+                    # push in-flight chunks so the consumer never stalls.
 
                     tool_calls = [
                         {
@@ -2037,12 +2042,17 @@ class OpenAICompletionsEventHandler(AIAgentEventHandler):
             accumulated_partial_text_parts = []
             index += 1
 
-        if content_message_started:
+        # Terminal round of the conversation — send message_end IF any round
+        # in this conversation (this one or a prior tool-call round) started a
+        # content message. Guarded by the conversation-level flag so a purely
+        # tool-then-empty-final-turn stream still cleanly closes the message.
+        if self._conversation_content_started:
             self.send_data_to_stream(
                 index=index,
                 data_format=output_format,
                 is_message_end=True,
             )
+            self._conversation_content_started = False
 
         final_accumulated_text = "".join(accumulated_text_parts)
         if not self._has_valid_content(final_accumulated_text):
